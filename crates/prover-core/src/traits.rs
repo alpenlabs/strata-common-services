@@ -188,6 +188,11 @@ pub trait ProofSpec: Send + Sync + 'static {
 /// Overlapping namespaces across independent provers are not supported,
 /// because startup recovery treats `Proving` rows as interrupted work. Use
 /// disjoint stores or scoped key prefixes per owner.
+///
+/// Lifecycle writes are ordered but not transactional. The status goes last, so
+/// a crash or a failed write between the metadata, deadline and status writes
+/// leaves the row `Proving`, which restart recovery treats as an interrupted
+/// attempt.
 pub trait TaskStore: Send + Sync + 'static {
     fn get(&self, key: &[u8]) -> ProverResult<Option<TaskRecord>>;
     fn insert(&self, record: TaskRecord) -> ProverResult<()>;

@@ -237,8 +237,8 @@ impl<H: ProofSpec> Prover<H> {
     /// backoff, or `PermanentFailure` once `max_retries` is spent. `Pending`
     /// rows need nothing here; dispatch starts them.
     ///
-    /// A failed scan leaves recovery incomplete, and the next submit or tick
-    /// runs it again before starting any work.
+    /// A failed scan or write leaves recovery incomplete, and the next submit
+    /// or tick runs it again before starting any work.
     fn ensure_recovered(&self, dispatch: &mut DispatchState) -> ProverResult<()> {
         if dispatch.recovered {
             return Ok(());
@@ -253,7 +253,7 @@ impl<H: ProofSpec> Prover<H> {
                 retry_count = counts.retry.saturating_add(1),
                 "task died mid-Proving; scheduling resume-class retry"
             );
-            let status = self.schedule_retry(key, "process died mid-Proving", *counts, false);
+            let status = self.schedule_retry(key, "process died mid-Proving", *counts, false)?;
             if let Some(task) = decode_task_key::<H>(key) {
                 self.notify(key, &task, &status);
             }
@@ -315,14 +315,12 @@ impl<H: ProofSpec> Prover<H> {
                         if let Some(hook) = &self.receipt_hook {
                             if let Err(e) = hook.on_receipt(&task, &receipt).await {
                                 error!(%e, "receipt hook failed (checkpoint path)");
-                                let status = self.handle_error(&key, &e, counts);
-                                self.notify(&key, &task, &status);
+                                self.settle(&key, &task, self.handle_error(&key, &e, counts));
                                 return;
                             }
                         }
-                        let _ = self.task_store.update_status(&key, TaskStatus::Completed);
                         info!("task completed (from checkpointed receipt)");
-                        self.notify(&key, &task, &TaskStatus::Completed);
+                        self.settle(&key, &task, self.write_status(&key, TaskStatus::Completed));
                         return;
                     }
                     // No checkpoint yet — fall through to a full prove.
@@ -334,8 +332,7 @@ impl<H: ProofSpec> Prover<H> {
                         // success. Classify it (Storage -> RetryResume) and
                         // retry the checkpoint instead.
                         error!(%e, "receipt store read failed on checkpoint path");
-                        let status = self.handle_error(&key, &e, counts);
-                        self.notify(&key, &task, &status);
+                        self.settle(&key, &task, self.handle_error(&key, &e, counts));
                         return;
                     }
                 }
@@ -350,20 +347,19 @@ impl<H: ProofSpec> Prover<H> {
                 }) => {
                     // Not a failure — park and recheck without notifying waiters
                     // or touching the retry budget (but bounded by the backstop).
-                    self.park_blocked(&key, &task, reason, recheck_after, counts);
+                    let outcome = self.park_blocked(&key, reason, recheck_after, counts);
+                    self.settle(&key, &task, outcome);
                     return;
                 }
                 Ok(InputResolution::Rejected { reason }) => {
                     error!(%reason, "input rejected");
                     let status = TaskStatus::PermanentFailure { error: reason };
-                    let _ = self.task_store.update_status(&key, status.clone());
-                    self.notify(&key, &task, &status);
+                    self.settle(&key, &task, self.write_status(&key, status));
                     return;
                 }
                 Err(e) => {
                     error!(%e, "resolve_input failed");
-                    let status = self.handle_error(&key, &e, counts);
-                    self.notify(&key, &task, &status);
+                    self.settle(&key, &task, self.handle_error(&key, &e, counts));
                     return;
                 }
             };
@@ -371,9 +367,17 @@ impl<H: ProofSpec> Prover<H> {
             // 2. Prove (blocking — strategy handles native vs remote)
             let store = self.task_store.clone();
             let persist_key = key.clone();
-            let ctx = ProveContext::new(saved_metadata, move |data| {
-                let _ = store.set_metadata(&persist_key, data);
-            });
+            let ctx = ProveContext::new(
+                saved_metadata,
+                move |data| {
+                    if let Err(e) = store.set_metadata(&persist_key, data) {
+                        error!(
+                            %e,
+                            "failed to save remote proof ID; a restart before completion resubmits the proof"
+                        );
+                    }
+                },
+            );
 
             let strategy = self.strategy.clone();
             let prove_result = spawn_blocking(move || strategy.prove(&input, ctx)).await;
@@ -382,8 +386,7 @@ impl<H: ProofSpec> Prover<H> {
                 Ok(Ok(receipt)) => receipt,
                 Ok(Err(e)) => {
                     error!(%e, "prove failed");
-                    let status = self.handle_error(&key, &e, counts);
-                    self.notify(&key, &task, &status);
+                    self.settle(&key, &task, self.handle_error(&key, &e, counts));
                     return;
                 }
                 Err(e) => {
@@ -391,8 +394,7 @@ impl<H: ProofSpec> Prover<H> {
                     let status = TaskStatus::PermanentFailure {
                         error: e.to_string(),
                     };
-                    let _ = self.task_store.update_status(&key, status.clone());
-                    self.notify(&key, &task, &status);
+                    self.settle(&key, &task, self.write_status(&key, status));
                     return;
                 }
             };
@@ -401,8 +403,7 @@ impl<H: ProofSpec> Prover<H> {
             if let Some(store) = &self.receipt_store {
                 if let Err(e) = store.put(&key, &receipt) {
                     error!(%e, "receipt store put failed");
-                    let status = self.handle_error(&key, &e, counts);
-                    self.notify(&key, &task, &status);
+                    self.settle(&key, &task, self.handle_error(&key, &e, counts));
                     return;
                 }
             }
@@ -411,19 +412,39 @@ impl<H: ProofSpec> Prover<H> {
             if let Some(hook) = &self.receipt_hook {
                 if let Err(e) = hook.on_receipt(&task, &receipt).await {
                     error!(%e, "receipt hook failed");
-                    let status = self.handle_error(&key, &e, counts);
-                    self.notify(&key, &task, &status);
+                    self.settle(&key, &task, self.handle_error(&key, &e, counts));
                     return;
                 }
             }
 
             // 5. Done
-            let _ = self.task_store.update_status(&key, TaskStatus::Completed);
             info!("task completed");
-            self.notify(&key, &task, &TaskStatus::Completed);
+            self.settle(&key, &task, self.write_status(&key, TaskStatus::Completed));
         }
         .instrument(span)
         .await;
+    }
+
+    /// Ends an attempt: tells waiters about a recorded terminal status, or
+    /// logs a failed write.
+    ///
+    /// A failed write leaves the row `Proving`, which restart recovery treats
+    /// as an interrupted attempt. Waiters only ever hear outcomes the task
+    /// store holds.
+    fn settle(&self, key: &[u8], task: &H::Task, outcome: ProverResult<TaskStatus>) {
+        match outcome {
+            Ok(status) => self.notify(key, task, &status),
+            Err(e) => error!(
+                %e,
+                "failed to record proof task outcome; restart recovery will retry the task"
+            ),
+        }
+    }
+
+    /// Writes `status` and returns it for [`Self::settle`].
+    fn write_status(&self, key: &[u8], status: TaskStatus) -> ProverResult<TaskStatus> {
+        self.task_store.update_status(key, status.clone())?;
+        Ok(status)
     }
 
     /// Park a task that is waiting on an input dependency.
@@ -432,21 +453,20 @@ impl<H: ProofSpec> Prover<H> {
     /// `retry_after`. Does not touch the retry/resubmit counters or notify
     /// waiters — blocking is an expected wait, not a failure, so the scanner
     /// re-spawns it (via [`TaskStatus::wants_rescan`]) when the recheck is due.
-    /// `counts` is the [`AttemptCounts`] snapshotted before the `Proving`
-    /// overwrite in [`Self::run_task`]; `park_blocked` bumps only `recheck` and
-    /// preserves `retry`/`resubmit`, so a `Blocked` wait interleaved with
-    /// transient failures keeps every budget bounded. Once `recheck` exceeds
-    /// [`RetryConfig::max_blocked_rechecks`] the dependency is treated as never
-    /// going to materialize: the task is promoted to `PermanentFailure` and its
-    /// waiters are notified, rather than rechecking — and hanging — forever.
+    /// `counts` is the [`AttemptCounts`] the row carried before this attempt;
+    /// `park_blocked` bumps only `recheck` and preserves `retry`/`resubmit`, so
+    /// a `Blocked` wait interleaved with transient failures keeps every budget
+    /// bounded. Once `recheck` exceeds [`RetryConfig::max_blocked_rechecks`]
+    /// the dependency is treated as never going to materialize: the task is
+    /// promoted to `PermanentFailure`, rather than rechecking — and hanging —
+    /// forever.
     fn park_blocked(
         &self,
         key: &[u8],
-        task: &H::Task,
         reason: String,
         recheck_after: Option<Duration>,
         counts: AttemptCounts,
-    ) {
+    ) -> ProverResult<TaskStatus> {
         let counts = AttemptCounts {
             recheck: counts.recheck.saturating_add(1),
             ..counts
@@ -464,9 +484,7 @@ impl<H: ProofSpec> Prover<H> {
                 let status = TaskStatus::PermanentFailure {
                     error: format!("blocked dependency unresolved after {max} rechecks: {reason}"),
                 };
-                let _ = self.task_store.update_status(key, status.clone());
-                self.notify(key, task, &status);
-                return;
+                return self.write_status(key, status);
             }
         }
 
@@ -482,27 +500,31 @@ impl<H: ProofSpec> Prover<H> {
             recheck_count = counts.recheck,
             "task blocked on dependency"
         );
-        let _ = self
-            .task_store
-            .update_status(key, TaskStatus::Blocked { reason, counts });
-        let _ = self
-            .task_store
-            .set_retry_after(key, now_secs().saturating_add(secs));
+        // The deadline goes in before the status: if the status write then
+        // fails, the row stays `Proving` for restart recovery instead of
+        // becoming `Blocked` with a stale or missing deadline.
+        self.task_store
+            .set_retry_after(key, now_secs().saturating_add(secs))?;
+        self.write_status(key, TaskStatus::Blocked { reason, counts })
     }
 
     /// Persist the outcome of a failed attempt and return the status written,
     /// so the caller can hand it to [`Self::notify`] without a fallible re-read.
-    fn handle_error(&self, key: &[u8], err: &ProverError, counts: AttemptCounts) -> TaskStatus {
+    fn handle_error(
+        &self,
+        key: &[u8],
+        err: &ProverError,
+        counts: AttemptCounts,
+    ) -> ProverResult<TaskStatus> {
         match err.action() {
             FailureAction::RetryResume => self.schedule_retry(key, &err.to_string(), counts, false),
             FailureAction::RetryFresh => self.schedule_retry(key, &err.to_string(), counts, true),
-            FailureAction::Permanent => {
-                let status = TaskStatus::PermanentFailure {
+            FailureAction::Permanent => self.write_status(
+                key,
+                TaskStatus::PermanentFailure {
                     error: err.to_string(),
-                };
-                let _ = self.task_store.update_status(key, status.clone());
-                status
-            }
+                },
+            ),
         }
     }
 
@@ -514,19 +536,23 @@ impl<H: ProofSpec> Prover<H> {
     /// and draw from the smaller `max_resubmits` budget since each one re-runs
     /// the whole proof. When the relevant budget is exhausted the task becomes
     /// `PermanentFailure`. Backoff is keyed on whichever counter advanced.
+    ///
+    /// The metadata clear and the deadline are written before the status, and
+    /// the first failed write stops the sequence. The row then stays `Proving`
+    /// for restart recovery rather than becoming a retry that no scan picks up.
     fn schedule_retry(
         &self,
         key: &[u8],
         msg: &str,
         counts: AttemptCounts,
         fresh: bool,
-    ) -> TaskStatus {
+    ) -> ProverResult<TaskStatus> {
         if let Some(ref cfg) = self.config.retry {
             // Bump only the advancing counter; the others (including `recheck`)
             // carry through so an interleaved Blocked/transient sequence stays
             // bounded by every ceiling.
             let (new_counts, within_budget, attempt) = if fresh {
-                let n = counts.resubmit + 1;
+                let n = counts.resubmit.saturating_add(1);
                 (
                     AttemptCounts {
                         resubmit: n,
@@ -536,14 +562,14 @@ impl<H: ProofSpec> Prover<H> {
                     n,
                 )
             } else {
-                let n = counts.retry + 1;
+                let n = counts.retry.saturating_add(1);
                 (AttemptCounts { retry: n, ..counts }, cfg.should_retry(n), n)
             };
 
             if within_budget {
                 if fresh {
                     // Drop the dead remote ProofId so the next attempt resubmits.
-                    let _ = self.task_store.clear_metadata(key);
+                    self.task_store.clear_metadata(key)?;
                 }
                 warn!(
                     retry_count = new_counts.retry,
@@ -553,24 +579,25 @@ impl<H: ProofSpec> Prover<H> {
                     error = %msg,
                     "scheduling retry"
                 );
-                let status = TaskStatus::TransientFailure {
-                    counts: new_counts,
-                    error: msg.to_string(),
-                };
-                let _ = self.task_store.update_status(key, status.clone());
                 let delay_secs = cfg.jittered_delay_secs(attempt, jitter_seed(key, attempt));
-                let _ = self
-                    .task_store
-                    .set_retry_after(key, now_secs().saturating_add(delay_secs));
-                return status;
+                self.task_store
+                    .set_retry_after(key, now_secs().saturating_add(delay_secs))?;
+                return self.write_status(
+                    key,
+                    TaskStatus::TransientFailure {
+                        counts: new_counts,
+                        error: msg.to_string(),
+                    },
+                );
             }
         }
 
-        let status = TaskStatus::PermanentFailure {
-            error: format!("retries exhausted: {msg}"),
-        };
-        let _ = self.task_store.update_status(key, status.clone());
-        status
+        self.write_status(
+            key,
+            TaskStatus::PermanentFailure {
+                error: format!("retries exhausted: {msg}"),
+            },
+        )
     }
 
     /// Fan out the terminal result to every pending waiter and remove the

@@ -113,6 +113,10 @@ async fn until(mut f: impl FnMut() -> bool) {
 struct FaultStore {
     inner: InMemoryTaskStore,
     fail_scan: AtomicBool,
+    fail_update: AtomicBool,
+    fail_deadline: AtomicBool,
+    fail_clear: AtomicBool,
+    fail_metadata: AtomicBool,
     fail_proving_key: Mutex<Option<Vec<u8>>>,
     write_failures: AtomicUsize,
 }
@@ -132,18 +136,27 @@ impl TaskStore for FaultStore {
     fn update_status(&self, k: &[u8], s: TaskStatus) -> ProverResult<()> {
         let proving_fails = matches!(s, TaskStatus::Proving { .. })
             && self.fail_proving_key.lock().as_deref() == Some(k);
-        if proving_fails {
+        if self.fail_update.load(Ordering::SeqCst) || proving_fails {
             return self.fail("update");
         }
         self.inner.update_status(k, s)
     }
     fn set_retry_after(&self, k: &[u8], t: u64) -> ProverResult<()> {
+        if self.fail_deadline.load(Ordering::SeqCst) {
+            return self.fail("set_retry_after");
+        }
         self.inner.set_retry_after(k, t)
     }
     fn set_metadata(&self, k: &[u8], d: Vec<u8>) -> ProverResult<()> {
+        if self.fail_metadata.load(Ordering::SeqCst) {
+            return self.fail("set_metadata");
+        }
         self.inner.set_metadata(k, d)
     }
     fn clear_metadata(&self, k: &[u8]) -> ProverResult<()> {
+        if self.fail_clear.load(Ordering::SeqCst) {
+            return self.fail("clear_metadata");
+        }
         self.inner.clear_metadata(k)
     }
     fn list_retriable(&self, t: u64) -> ProverResult<Vec<TaskRecord>> {
@@ -214,10 +227,12 @@ async fn failed_recovery_blocks_submission_and_is_retried() {
     let (p, entered, gate) = build(store.clone(), false);
     assert!(p.submit(Task(1)).await.is_err());
     assert!(!p.dispatch.lock().recovered);
+    store.fail_scan.store(false, Ordering::SeqCst);
+    store.fail_update.store(true, Ordering::SeqCst);
     p.tick().await;
     assert!(!p.dispatch.lock().recovered);
     assert_eq!(entered.load(Ordering::SeqCst), 0);
-    store.fail_scan.store(false, Ordering::SeqCst);
+    store.fail_update.store(false, Ordering::SeqCst);
     p.submit(Task(1)).await.unwrap();
     assert!(p.dispatch.lock().recovered);
     assert!(matches!(
@@ -274,4 +289,122 @@ async fn recovery_preserves_metadata_and_all_attempt_counters() {
         AttemptCounts { retry: 2, ..counts }
     );
     gate.add_permits(1);
+}
+
+#[tokio::test]
+async fn failed_completion_write_leaves_the_row_for_restart_recovery() {
+    let store = Arc::new(FaultStore::default());
+    let (p, entered, gate) = build(store.clone(), false);
+    p.submit(Task(1)).await.unwrap();
+    until(|| entered.load(Ordering::SeqCst) == 1).await;
+    store.fail_update.store(true, Ordering::SeqCst);
+    gate.add_permits(1);
+    until(|| store.write_failures.load(Ordering::SeqCst) > 0).await;
+    store.fail_update.store(false, Ordering::SeqCst);
+
+    // Waiters hear only recorded outcomes, and dispatch never restarts a
+    // `Proving` row in the same process.
+    let waited = timeout(Duration::from_millis(200), p.wait_for_tasks(&[Task(1)])).await;
+    assert!(waited.is_err());
+    p.tick().await;
+    assert!(matches!(
+        p.get_status(&Task(1)).unwrap(),
+        TaskStatus::Proving { .. }
+    ));
+    assert_eq!(entered.load(Ordering::SeqCst), 1);
+
+    // A restarted prover counts the attempt as interrupted.
+    let (mut restarted, _, _) = build(store.clone(), false);
+    Arc::get_mut(&mut restarted).unwrap().config.retry = Some(RetryConfig::default());
+    restarted.tick().await;
+    let status = restarted.get_status(&Task(1)).unwrap();
+    assert!(matches!(status, TaskStatus::TransientFailure { .. }));
+    assert_eq!(status.counts().retry, 1);
+}
+
+#[tokio::test]
+async fn failed_deadline_write_leaves_a_blocked_task_proving() {
+    let store = Arc::new(FaultStore::default());
+    store.fail_deadline.store(true, Ordering::SeqCst);
+    let (p, _, _) = build(store.clone(), true);
+    p.submit(Task(1)).await.unwrap();
+    until(|| store.write_failures.load(Ordering::SeqCst) > 0).await;
+    let record = store.get(&[1]).unwrap().unwrap();
+    assert!(matches!(record.status(), TaskStatus::Proving { .. }));
+    assert_eq!(record.retry_after_secs(), None);
+    assert_eq!(record.status().counts().recheck, 0);
+}
+
+struct ResubmitStrategy;
+impl ProveStrategy<Spec> for ResubmitStrategy {
+    fn prove(&self, _: &(), _ctx: ProveContext) -> ProverResult<ProofReceiptWithMetadata> {
+        Err(ProverError::resubmit("expired remote request"))
+    }
+}
+
+#[tokio::test]
+async fn retry_writes_metadata_clear_and_deadline_before_status() {
+    for (fail_clear, fail_deadline) in [(true, false), (false, true), (false, false)] {
+        let store = Arc::new(FaultStore::default());
+        store
+            .insert(TaskRecord::new(vec![1], TaskStatus::Pending))
+            .unwrap();
+        store.set_metadata(&[1], vec![42]).unwrap();
+        store.fail_clear.store(fail_clear, Ordering::SeqCst);
+        store.fail_deadline.store(fail_deadline, Ordering::SeqCst);
+        let (mut p, _, gate) = build(store.clone(), false);
+        let inner = Arc::get_mut(&mut p).unwrap();
+        inner.config.retry = Some(RetryConfig::default());
+        inner.strategy = Arc::new(ResubmitStrategy);
+        p.submit(Task(1)).await.unwrap();
+        gate.add_permits(1);
+        until(|| {
+            store.write_failures.load(Ordering::SeqCst) > 0
+                || !store.get(&[1]).unwrap().unwrap().status().is_in_progress()
+        })
+        .await;
+
+        let record = store.get(&[1]).unwrap().unwrap();
+        if fail_clear || fail_deadline {
+            // The first failed write stops the sequence before the status.
+            assert!(matches!(record.status(), TaskStatus::Proving { .. }));
+            assert_eq!(record.status().counts().resubmit, 0);
+            if fail_clear {
+                assert_eq!(record.metadata(), Some([42].as_slice()));
+            }
+        } else {
+            assert!(matches!(
+                record.status(),
+                TaskStatus::TransientFailure { .. }
+            ));
+            assert_eq!(record.status().counts().resubmit, 1);
+            assert_eq!(record.metadata(), None);
+            assert!(record.retry_after_secs().is_some());
+        }
+    }
+}
+
+/// Saves a proof ID the way the remote strategy does, then succeeds.
+#[cfg(feature = "remote")]
+struct SaveIdStrategy;
+#[cfg(feature = "remote")]
+impl ProveStrategy<Spec> for SaveIdStrategy {
+    fn prove(&self, _: &(), mut ctx: ProveContext) -> ProverResult<ProofReceiptWithMetadata> {
+        ctx.persist(vec![7]);
+        Ok(ProofReceiptWithMetadata::default())
+    }
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn failed_proof_id_write_is_logged_and_the_attempt_continues() {
+    let store = Arc::new(FaultStore::default());
+    store.fail_metadata.store(true, Ordering::SeqCst);
+    let (mut p, _, gate) = build(store.clone(), false);
+    Arc::get_mut(&mut p).unwrap().strategy = Arc::new(SaveIdStrategy);
+    p.submit(Task(1)).await.unwrap();
+    gate.add_permits(1);
+    until(|| p.get_status(&Task(1)).unwrap() == TaskStatus::Completed).await;
+    assert_eq!(store.write_failures.load(Ordering::SeqCst), 1);
+    assert_eq!(store.get(&[1]).unwrap().unwrap().metadata(), None);
 }
