@@ -1,10 +1,13 @@
 //! Core prover: fetches input via spec, proves via strategy,
 //! optionally stores receipt and calls domain hook.
 
-use std::{collections::HashMap, fmt, slice, sync::Arc, time::Duration};
+use std::{collections::HashMap, fmt, num::NonZeroUsize, slice, sync::Arc, time::Duration};
 
 use parking_lot::Mutex;
-use tokio::{sync::oneshot, task::spawn_blocking};
+use tokio::{
+    sync::{oneshot, OwnedSemaphorePermit, Semaphore},
+    task::spawn_blocking,
+};
 use tracing::{debug, error, info, info_span, warn, Instrument};
 use zkaleido::ZkVmHost;
 #[cfg(feature = "remote")]
@@ -33,6 +36,39 @@ type WatcherMap<T> = HashMap<Vec<u8>, Vec<oneshot::Sender<TaskResult<T>>>>;
 /// `RetryConfig::blocked_recheck_secs`; this is only a floor.
 const DEFAULT_BLOCKED_RECHECK_SECS: u64 = 10;
 
+/// Shared limit on concurrent proof input preparation and submission.
+///
+/// A task takes one unit of capacity before it prepares its input. Native
+/// proving holds the unit until the blocking proof returns. Remote proving
+/// releases it once a new proof ID is saved, or a saved one is accepted, before
+/// polling, so the budget does not limit how many remote proofs run at once.
+/// Receipt storage and receipt hooks run without capacity.
+///
+/// Clone one budget into every prover that should share it. A task that finds
+/// no capacity stays a durable `Pending` row until a later [`Prover::tick`]
+/// starts it; no task waits in memory for capacity.
+#[derive(Clone, Debug)]
+pub struct ConcurrencyBudget(Arc<Semaphore>);
+
+impl ConcurrencyBudget {
+    /// Creates a budget of `max` concurrent preparations and submissions.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `max` exceeds [`Semaphore::MAX_PERMITS`].
+    pub fn new(max: NonZeroUsize) -> Self {
+        Self(Arc::new(Semaphore::new(max.get())))
+    }
+
+    fn try_acquire(&self) -> Option<OwnedSemaphorePermit> {
+        self.0.clone().try_acquire_owned().ok()
+    }
+
+    fn is_exhausted(&self) -> bool {
+        self.0.available_permits() == 0
+    }
+}
+
 /// State guarded by the dispatch lock, which serializes startup recovery with
 /// every task start from [`Prover::submit`] and [`Prover::tick`].
 #[derive(Debug, Default)]
@@ -56,6 +92,7 @@ pub struct Prover<H: ProofSpec> {
     receipt_hook: Option<Arc<dyn ReceiptHook<H>>>,
     /// Oneshot senders for notifying waiters when tasks reach terminal states.
     watchers: Arc<Mutex<WatcherMap<H::Task>>>,
+    concurrency_budget: Option<ConcurrencyBudget>,
     dispatch: Mutex<DispatchState>,
 }
 
@@ -65,6 +102,7 @@ impl<H: ProofSpec> fmt::Debug for Prover<H> {
             .field("has_retry", &self.config.retry.is_some())
             .field("has_receipt_store", &self.receipt_store.is_some())
             .field("has_receipt_hook", &self.receipt_hook.is_some())
+            .field("has_concurrency_budget", &self.concurrency_budget.is_some())
             .finish()
     }
 }
@@ -79,10 +117,12 @@ impl<H: ProofSpec> fmt::Debug for Prover<H> {
 // ============================================================================
 
 impl<H: ProofSpec> Prover<H> {
-    /// Registers a task and starts it. Idempotent.
+    /// Registers a task and starts it when capacity allows. Idempotent.
     ///
-    /// Submitting a task that already exists starts it only if it is
-    /// `Pending` or its retry is due, which is what the next tick would do.
+    /// A task that finds no capacity stays a durable `Pending` row until
+    /// [`Self::tick`] starts it, so a prover with a [`ConcurrencyBudget`] must
+    /// be ticked. Submitting a task that already exists starts it only if it
+    /// is `Pending` or its retry is due, which is what the next tick would do.
     pub async fn submit(self: &Arc<Self>, task: H::Task) -> ProverResult<()> {
         let key: Vec<u8> = task.clone().into();
         let mut dispatch = self.dispatch.lock();
@@ -178,6 +218,12 @@ impl<H: ProofSpec> Prover<H> {
         self.config.retry.is_some()
     }
 
+    /// Whether the prover needs periodic ticks: retries and dependency
+    /// rechecks fire, and capacity-limited tasks start, only on a tick.
+    pub fn needs_tick(&self) -> bool {
+        self.has_retry() || self.concurrency_budget.is_some()
+    }
+
     pub fn has_receipt_store(&self) -> bool {
         self.receipt_store.is_some()
     }
@@ -195,29 +241,39 @@ impl<H: ProofSpec> Prover<H> {
             .ok_or_else(|| ProverError::TaskNotFound(format!("{task}")))
     }
 
-    /// Starts `Pending` tasks and due retries and rechecks. Called by PaaS on
-    /// its tick interval.
+    /// Starts `Pending` tasks and due retries and rechecks while capacity
+    /// allows. Called by PaaS on its tick interval.
     pub async fn tick(self: &Arc<Self>) {
         if let Err(e) = self.dispatch_tasks() {
             warn!(%e, "failed to dispatch proof tasks; will retry next tick");
         }
     }
 
-    /// Starts runnable tasks.
+    /// Starts runnable tasks while the budget has room.
     ///
     /// The order is not a priority policy. `Pending` rows are tried before due
     /// `TransientFailure` and `Blocked` rows, each group in the task store's
     /// listing order (key order for the sled and MDBX stores, where EE chunk
-    /// keys are block hashes rather than chain order).
+    /// keys are block hashes rather than chain order). Under a small budget
+    /// with native proving, new work can therefore run before older retries.
+    /// Remote proving holds capacity only until submission, so the effect
+    /// there is limited to preparation time.
     ///
     /// A failure to start one row is logged and does not stop the others.
     fn dispatch_tasks(self: &Arc<Self>) -> ProverResult<()> {
         let mut dispatch = self.dispatch.lock();
         self.ensure_recovered(&mut dispatch)?;
+        // Every start needs capacity, so skip the store scans while none is free.
+        if self.budget_exhausted() {
+            return Ok(());
+        }
         let mut runnable = self.task_store.list_unfinished()?;
         runnable.retain(|record| matches!(record.status(), TaskStatus::Pending));
         runnable.extend(self.task_store.list_retriable(now_secs())?);
         for record in runnable {
+            if self.budget_exhausted() {
+                break;
+            }
             let key = record.key().to_vec();
             if let Some(task) = decode_task_key::<H>(&key) {
                 if let Err(e) = self.try_start_task(task, key) {
@@ -228,6 +284,12 @@ impl<H: ProofSpec> Prover<H> {
         Ok(())
     }
 
+    fn budget_exhausted(&self) -> bool {
+        self.concurrency_budget
+            .as_ref()
+            .is_some_and(ConcurrencyBudget::is_exhausted)
+    }
+
     /// Runs startup recovery once, before any task starts.
     ///
     /// A `Proving` row found here belongs to an attempt that died with the
@@ -235,7 +297,7 @@ impl<H: ProofSpec> Prover<H> {
     /// Recovery counts that death as a resume-class failure, so a task that
     /// keeps killing the process cannot rerun forever: it gets a retry after
     /// backoff, or `PermanentFailure` once `max_retries` is spent. `Pending`
-    /// rows need nothing here; dispatch starts them.
+    /// rows need nothing here; dispatch starts them under the budget.
     ///
     /// A failed scan or write leaves recovery incomplete, and the next submit
     /// or tick runs it again before starting any work.
@@ -262,7 +324,7 @@ impl<H: ProofSpec> Prover<H> {
         Ok(())
     }
 
-    /// Starts `task` if its row is runnable.
+    /// Starts `task` if its row is runnable and capacity allows.
     ///
     /// Called with the dispatch lock held, so the row is `Proving` before any
     /// other caller can see it as runnable.
@@ -277,6 +339,13 @@ impl<H: ProofSpec> Prover<H> {
         if !runnable {
             return Ok(());
         }
+        let permit = match &self.concurrency_budget {
+            Some(budget) => match budget.try_acquire() {
+                Some(permit) => Some(permit),
+                None => return Ok(()),
+            },
+            None => None,
+        };
         // The status carries the attempt counters, so they survive a crash
         // that recovery later counts as a failed attempt.
         self.task_store.update_status(
@@ -287,7 +356,7 @@ impl<H: ProofSpec> Prover<H> {
         )?;
         let prover = Arc::clone(self);
         tokio::spawn(async move {
-            prover.run_task(task, key, record).await;
+            prover.run_task(task, key, record, permit).await;
         });
         Ok(())
     }
@@ -296,8 +365,15 @@ impl<H: ProofSpec> Prover<H> {
     ///
     /// `record` is the row as dispatch found it, before the `Proving`
     /// overwrite, so it still carries the attempt counters and any saved remote
-    /// proof ID.
-    async fn run_task(&self, task: H::Task, key: Vec<u8>, record: TaskRecord) {
+    /// proof ID. `permit` is the task's unit of submission capacity, if the
+    /// prover has a budget.
+    async fn run_task(
+        &self,
+        task: H::Task,
+        key: Vec<u8>,
+        record: TaskRecord,
+        permit: Option<OwnedSemaphorePermit>,
+    ) {
         let counts = record.status().counts();
         let saved_metadata = record.metadata().map(<[u8]>::to_vec);
         let span = info_span!("prove", task = %task);
@@ -311,6 +387,8 @@ impl<H: ProofSpec> Prover<H> {
             if let Some(receipt_store) = self.receipt_store.as_ref() {
                 match receipt_store.get(&key) {
                     Ok(Some(receipt)) => {
+                        // A stored receipt needs no input preparation or submission.
+                        drop(permit);
                         debug!("receipt already persisted; skipping prove, running hook only");
                         if let Some(hook) = &self.receipt_hook {
                             if let Err(e) = hook.on_receipt(&task, &receipt).await {
@@ -377,6 +455,7 @@ impl<H: ProofSpec> Prover<H> {
                         );
                     }
                 },
+                permit,
             );
 
             let strategy = self.strategy.clone();
@@ -678,6 +757,7 @@ pub struct ProverBuilder<H: ProofSpec> {
     receipt_store: Option<Arc<dyn ReceiptStore>>,
     receipt_hook: Option<Arc<dyn ReceiptHook<H>>>,
     retry: Option<RetryConfig>,
+    concurrency_budget: Option<ConcurrencyBudget>,
 }
 
 impl<H: ProofSpec> ProverBuilder<H> {
@@ -688,6 +768,7 @@ impl<H: ProofSpec> ProverBuilder<H> {
             receipt_store: None,
             receipt_hook: None,
             retry: None,
+            concurrency_budget: None,
         }
     }
 
@@ -716,6 +797,16 @@ impl<H: ProofSpec> ProverBuilder<H> {
         // backoff to zero. This is the single choke point every config passes
         // through.
         self.retry = Some(config.sanitized());
+        self
+    }
+
+    /// Limits concurrent input preparation and submission to a budget shared
+    /// with every prover given a clone of it.
+    ///
+    /// Without a budget, every submitted task starts at once. With one, tasks
+    /// beyond it wait as `Pending` rows that only [`Prover::tick`] starts.
+    pub fn concurrency_budget(mut self, budget: ConcurrencyBudget) -> Self {
+        self.concurrency_budget = Some(budget);
         self
     }
 
@@ -769,6 +860,7 @@ impl<H: ProofSpec> ProverBuilder<H> {
             receipt_store: self.receipt_store,
             receipt_hook: self.receipt_hook,
             watchers: Arc::new(Mutex::new(HashMap::new())),
+            concurrency_budget: self.concurrency_budget,
             dispatch: Mutex::new(DispatchState::default()),
         }
     }

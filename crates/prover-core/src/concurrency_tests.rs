@@ -6,8 +6,10 @@ use zkaleido::{
     ProofReceiptWithMetadata, ProofType, PublicValues, ZkVmInputBuilder, ZkVmInputResult,
     ZkVmProgram, ZkVmResult,
 };
+use zkaleido_native_adapter::NativeHost;
 
 use super::*;
+use crate::InMemoryReceiptStore;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Task(u8);
@@ -97,6 +99,21 @@ fn build(
         .build(Arc::new(Strategy));
     (Arc::new(prover), entered, gate)
 }
+fn build_limited(
+    budget: ConcurrencyBudget,
+    store: Arc<impl TaskStore>,
+    blocked: bool,
+) -> (Arc<Prover<Spec>>, Arc<AtomicUsize>, Arc<Semaphore>) {
+    let (spec, entered, gate) = spec(blocked);
+    let prover = ProverBuilder::new(spec)
+        .task_store(store)
+        .concurrency_budget(budget)
+        .build(Arc::new(Strategy));
+    (Arc::new(prover), entered, gate)
+}
+fn budget(n: usize) -> ConcurrencyBudget {
+    ConcurrencyBudget::new(NonZeroUsize::new(n).unwrap())
+}
 async fn until(mut f: impl FnMut() -> bool) {
     timeout(Duration::from_secs(5), async {
         while !f() {
@@ -107,8 +124,20 @@ async fn until(mut f: impl FnMut() -> bool) {
     .unwrap();
 }
 
-/// Wraps the in-memory store with switchable failures and key-ordered
-/// listings like the sled and MDBX stores.
+/// Ticks `prover` until `f` holds, for work that may find no capacity at first.
+async fn tick_until(prover: &Arc<Prover<Spec>>, mut f: impl FnMut() -> bool) {
+    timeout(Duration::from_secs(5), async {
+        while !f() {
+            prover.tick().await;
+            yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+/// Wraps the in-memory store with switchable failures, a scan counter and
+/// key-ordered listings like the sled and MDBX stores.
 #[derive(Default)]
 struct FaultStore {
     inner: InMemoryTaskStore,
@@ -119,6 +148,7 @@ struct FaultStore {
     fail_metadata: AtomicBool,
     fail_proving_key: Mutex<Option<Vec<u8>>>,
     write_failures: AtomicUsize,
+    scans: AtomicUsize,
 }
 impl FaultStore {
     fn fail(&self, what: &str) -> ProverResult<()> {
@@ -165,6 +195,7 @@ impl TaskStore for FaultStore {
         Ok(records)
     }
     fn list_unfinished(&self) -> ProverResult<Vec<TaskRecord>> {
+        self.scans.fetch_add(1, Ordering::SeqCst);
         if self.fail_scan.load(Ordering::SeqCst) {
             return Err(ProverError::Storage("scan unavailable".into()));
         }
@@ -407,4 +438,372 @@ async fn failed_proof_id_write_is_logged_and_the_attempt_continues() {
     until(|| p.get_status(&Task(1)).unwrap() == TaskStatus::Completed).await;
     assert_eq!(store.write_failures.load(Ordering::SeqCst), 1);
     assert_eq!(store.get(&[1]).unwrap().unwrap().metadata(), None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_budget_bounds_all_provers_before_input_and_pending_drains() {
+    // Four instances model chunk/account provers for two resident versions.
+    let budget = budget(2);
+    let provers: Vec<_> = (0..4)
+        .map(|_| build_limited(budget.clone(), Arc::new(InMemoryTaskStore::new()), false))
+        .collect();
+    for (p, _, _) in &provers {
+        for t in 0..20 {
+            p.submit(Task(t)).await.unwrap();
+        }
+    }
+    until(|| {
+        provers
+            .iter()
+            .map(|(_, n, _)| n.load(Ordering::SeqCst))
+            .sum::<usize>()
+            == 2
+    })
+    .await;
+    let pending: usize = provers
+        .iter()
+        .map(|(p, _, _)| {
+            p.task_store
+                .list_unfinished()
+                .unwrap()
+                .iter()
+                .filter(|r| matches!(r.status(), TaskStatus::Pending))
+                .count()
+        })
+        .sum();
+    assert_eq!(pending, 78);
+    for (_, _, gate) in &provers {
+        gate.add_permits(20);
+    }
+    timeout(Duration::from_secs(5), async {
+        loop {
+            for (p, _, _) in &provers {
+                p.tick().await;
+            }
+            if provers
+                .iter()
+                .all(|(p, _, _)| p.task_store.list_unfinished().unwrap().is_empty())
+            {
+                break;
+            }
+            yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        provers
+            .iter()
+            .map(|(_, n, _)| n.load(Ordering::SeqCst))
+            .sum::<usize>(),
+        80
+    );
+}
+
+#[tokio::test]
+async fn restart_pending_backlog_is_limited() {
+    let store = Arc::new(InMemoryTaskStore::new());
+    for t in 0..200 {
+        store
+            .insert(TaskRecord::new(vec![t], TaskStatus::Pending))
+            .unwrap();
+    }
+    let (p, entered, gate) = build_limited(budget(3), store.clone(), false);
+    p.tick().await;
+    until(|| entered.load(Ordering::SeqCst) == 3).await;
+    assert_eq!(
+        store
+            .list_unfinished()
+            .unwrap()
+            .iter()
+            .filter(|r| matches!(r.status(), TaskStatus::Pending))
+            .count(),
+        197
+    );
+    gate.add_permits(3);
+}
+
+#[tokio::test]
+async fn blocked_input_releases_capacity_without_spending_retry_budget() {
+    let shared = budget(1);
+    let (blocked, _, _) = build_limited(shared.clone(), Arc::new(InMemoryTaskStore::new()), true);
+    blocked.submit(Task(1)).await.unwrap();
+    until(|| {
+        matches!(
+            blocked.get_status(&Task(1)).unwrap(),
+            TaskStatus::Blocked { .. }
+        )
+    })
+    .await;
+    assert_eq!(blocked.get_status(&Task(1)).unwrap().counts().retry, 0);
+    let (ready, entered, gate) = build_limited(shared, Arc::new(InMemoryTaskStore::new()), false);
+    ready.submit(Task(2)).await.unwrap();
+    tick_until(&ready, || entered.load(Ordering::SeqCst) == 1).await;
+    gate.add_permits(1);
+}
+
+#[tokio::test]
+async fn dispatch_skips_store_scans_while_capacity_is_exhausted() {
+    let store = Arc::new(FaultStore::default());
+    let (p, entered, gate) = build_limited(budget(1), store.clone(), false);
+    p.submit(Task(1)).await.unwrap();
+    until(|| entered.load(Ordering::SeqCst) == 1).await;
+    let scans = store.scans.load(Ordering::SeqCst);
+    p.tick().await;
+    assert_eq!(store.scans.load(Ordering::SeqCst), scans);
+    gate.add_permits(1);
+    until(|| p.get_status(&Task(1)).unwrap() == TaskStatus::Completed).await;
+    p.tick().await;
+    assert_eq!(store.scans.load(Ordering::SeqCst), scans + 1);
+}
+
+struct Hook(Arc<Semaphore>, Arc<AtomicBool>);
+#[async_trait]
+impl ReceiptHook<Spec> for Hook {
+    async fn on_receipt(&self, _: &Task, _: &ProofReceiptWithMetadata) -> ProverResult<()> {
+        self.1.store(true, Ordering::SeqCst);
+        self.0.acquire().await.unwrap().forget();
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn receipt_hook_runs_without_submission_capacity() {
+    let shared = budget(1);
+    let (mut p, entered, gate) =
+        build_limited(shared.clone(), Arc::new(InMemoryTaskStore::new()), false);
+    let hook_gate = Arc::new(Semaphore::new(0));
+    let hook_entered = Arc::new(AtomicBool::new(false));
+    Arc::get_mut(&mut p).unwrap().receipt_hook =
+        Some(Arc::new(Hook(hook_gate.clone(), hook_entered.clone())));
+    p.submit(Task(1)).await.unwrap();
+    gate.add_permits(1);
+    until(|| hook_entered.load(Ordering::SeqCst)).await;
+
+    // The hook holds no capacity, so another prover's task starts meanwhile.
+    let (other, other_entered, other_gate) =
+        build_limited(shared, Arc::new(InMemoryTaskStore::new()), false);
+    other.submit(Task(2)).await.unwrap();
+    tick_until(&other, || other_entered.load(Ordering::SeqCst) == 1).await;
+
+    // The task is still `Proving`, so a tick does not start it again.
+    p.tick().await;
+    assert_eq!(entered.load(Ordering::SeqCst), 1);
+    hook_gate.add_permits(1);
+    until(|| p.get_status(&Task(1)).unwrap() == TaskStatus::Completed).await;
+    other_gate.add_permits(1);
+}
+
+#[tokio::test]
+async fn checkpointed_receipt_skips_preparation_and_releases_capacity_before_hook() {
+    let shared = budget(1);
+    let (mut p, inputs, _) =
+        build_limited(shared.clone(), Arc::new(InMemoryTaskStore::new()), false);
+    let receipts = InMemoryReceiptStore::new();
+    receipts
+        .put(&[1], &ProofReceiptWithMetadata::default())
+        .unwrap();
+    let hook_gate = Arc::new(Semaphore::new(0));
+    let hook_entered = Arc::new(AtomicBool::new(false));
+    let inner = Arc::get_mut(&mut p).unwrap();
+    inner.receipt_store = Some(Arc::new(receipts));
+    inner.receipt_hook = Some(Arc::new(Hook(hook_gate.clone(), hook_entered.clone())));
+    p.submit(Task(1)).await.unwrap();
+    until(|| hook_entered.load(Ordering::SeqCst)).await;
+    assert_eq!(inputs.load(Ordering::SeqCst), 0);
+    assert!(shared.try_acquire().is_some());
+    hook_gate.add_permits(1);
+    until(|| p.get_status(&Task(1)).unwrap() == TaskStatus::Completed).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelling_the_async_attempt_keeps_capacity_until_the_blocking_proof_exits() {
+    let shared = budget(1);
+    let store = Arc::new(InMemoryTaskStore::new());
+    let (mut p, _, input_gate) = build_limited(shared.clone(), store.clone(), false);
+    let entered = Arc::new(AtomicBool::new(false));
+    let release = Arc::new((Mutex::new(false), parking_lot::Condvar::new()));
+    let native_entered = entered.clone();
+    let native_release = release.clone();
+    let host = NativeHost::new_with_random_key(move |_| {
+        let (lock, notify) = native_release.as_ref();
+        let mut released = lock.lock();
+        native_entered.store(true, Ordering::SeqCst);
+        while !*released {
+            notify.wait(&mut released);
+        }
+    });
+    Arc::get_mut(&mut p).unwrap().strategy = Arc::new(NativeStrategy::new(host));
+    let key = vec![1];
+    store
+        .insert(TaskRecord::new(key.clone(), TaskStatus::Pending))
+        .unwrap();
+    let record = store.get(&key).unwrap().unwrap();
+    let permit = shared.try_acquire();
+    let runner = p.clone();
+    let task = tokio::spawn(async move {
+        runner.run_task(Task(1), key, record, permit).await;
+    });
+    input_gate.add_permits(1);
+    until(|| entered.load(Ordering::SeqCst)).await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    let still_limited = shared.try_acquire().is_none();
+    *release.0.lock() = true;
+    release.1.notify_all();
+    assert!(
+        still_limited,
+        "cancelled async owner freed a still-running proof's capacity"
+    );
+    until(|| shared.try_acquire().is_some()).await;
+}
+
+#[cfg(feature = "remote")]
+mod remote {
+    use serde::{de::DeserializeOwned, Serialize};
+    use zkaleido::{
+        ExecutionSummary, ProgramId, RemoteProofStatus, VerifyingKey, ZkVm, ZkVmExecutor,
+        ZkVmOutputExtractor, ZkVmProver, ZkVmRemoteProver, ZkVmTypedVerifier, ZkVmVkProvider,
+    };
+
+    use super::*;
+
+    type HostInput<'a> = <<NativeHost as ZkVmExecutor>::Input<'a> as ZkVmInputBuilder<'a>>::Input;
+    type HostReceipt = <NativeHost as ZkVmProver>::ZkVmProofReceipt;
+
+    /// Keeps the real `RemoteStrategy` polling until the test finishes it.
+    #[derive(Clone, Debug)]
+    struct Host {
+        native: NativeHost,
+        budget: ConcurrencyBudget,
+        submissions: Arc<AtomicUsize>,
+        polls: Arc<AtomicUsize>,
+        finish: Arc<Semaphore>,
+    }
+    impl ZkVmExecutor for Host {
+        type Input<'a> = <NativeHost as ZkVmExecutor>::Input<'a>;
+        fn execute<'a>(&self, input: HostInput<'a>) -> ZkVmResult<ExecutionSummary> {
+            self.native.execute(input)
+        }
+        fn get_elf(&self) -> &[u8] {
+            self.native.get_elf()
+        }
+        fn program_id(&self) -> ProgramId {
+            self.native.program_id()
+        }
+        fn save_trace(&self, name: &str) {
+            self.native.save_trace(name);
+        }
+    }
+    impl ZkVmProver for Host {
+        type ZkVmProofReceipt = HostReceipt;
+        fn prove_inner<'a>(
+            &self,
+            input: HostInput<'a>,
+            kind: ProofType,
+        ) -> ZkVmResult<HostReceipt> {
+            self.native.prove_inner(input, kind)
+        }
+    }
+    impl ZkVmTypedVerifier for Host {
+        type ZkVmProofReceipt = HostReceipt;
+        fn verify_inner(&self, receipt: &HostReceipt) -> ZkVmResult<()> {
+            self.native.verify_inner(receipt)
+        }
+    }
+    impl ZkVmOutputExtractor for Host {
+        fn extract_serde_public_output<T: Serialize + DeserializeOwned>(
+            values: &PublicValues,
+        ) -> ZkVmResult<T> {
+            NativeHost::extract_serde_public_output(values)
+        }
+    }
+    impl ZkVmVkProvider for Host {
+        fn vk(&self) -> VerifyingKey {
+            self.native.vk()
+        }
+    }
+    impl ZkVmHost for Host {
+        fn zkvm(&self) -> ZkVm {
+            self.native.zkvm()
+        }
+    }
+    #[async_trait]
+    impl ZkVmRemoteProver for Host {
+        type ProofId = Task;
+        async fn start_proving<'a>(&self, _: HostInput<'a>, _: ProofType) -> ZkVmResult<Task> {
+            assert!(
+                self.budget.try_acquire().is_none(),
+                "submission must own capacity"
+            );
+            self.submissions.fetch_add(1, Ordering::SeqCst);
+            Ok(Task(7))
+        }
+        async fn get_status(&self, _: &Task) -> ZkVmResult<RemoteProofStatus> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            self.finish.acquire().await.unwrap().forget();
+            Ok(RemoteProofStatus::Completed)
+        }
+        async fn get_proof(&self, _: &Task) -> ZkVmResult<ProofReceiptWithMetadata> {
+            Ok(ProofReceiptWithMetadata::default())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_capacity_is_released_after_submission_or_a_valid_saved_id() {
+        // A valid saved ID resumes; malformed metadata submits a replacement.
+        for saved in [None, Some(vec![7]), Some(Vec::new())] {
+            let resumed = saved.as_ref().is_some_and(|bytes| bytes.len() == 1);
+            let shared = budget(1);
+            let store = Arc::new(InMemoryTaskStore::new());
+            store
+                .insert(TaskRecord::new(vec![1], TaskStatus::Pending))
+                .unwrap();
+            if let Some(bytes) = saved {
+                store.set_metadata(&[1], bytes).unwrap();
+            }
+            let host = Host {
+                native: NativeHost::new_with_random_key(|_| {}),
+                budget: shared.clone(),
+                submissions: Arc::new(AtomicUsize::new(0)),
+                polls: Arc::new(AtomicUsize::new(0)),
+                finish: Arc::new(Semaphore::new(0)),
+            };
+            let (spec, entered, gate) = spec(false);
+            gate.add_permits(2);
+            let p = Arc::new(
+                ProverBuilder::new(spec)
+                    .task_store(store.clone())
+                    .concurrency_budget(shared.clone())
+                    .remote_with_interval(host.clone(), Duration::from_millis(1)),
+            );
+            p.submit(Task(1)).await.unwrap();
+            until(|| host.polls.load(Ordering::SeqCst) == 1).await;
+
+            // Polling holds no capacity, and the proof ID is saved before it.
+            assert!(shared.try_acquire().is_some());
+            assert_eq!(
+                store.get(&[1]).unwrap().unwrap().metadata(),
+                Some([7].as_slice())
+            );
+
+            // The polling task is `Proving`: a resubmit or tick leaves it alone,
+            // while a different task can submit.
+            p.submit(Task(1)).await.unwrap();
+            p.tick().await;
+            assert_eq!(entered.load(Ordering::SeqCst), 1);
+            p.submit(Task(2)).await.unwrap();
+            until(|| host.polls.load(Ordering::SeqCst) == 2).await;
+            assert_eq!(
+                host.submissions.load(Ordering::SeqCst),
+                if resumed { 1 } else { 2 }
+            );
+            host.finish.add_permits(2);
+            until(|| {
+                p.get_status(&Task(1)).unwrap() == TaskStatus::Completed
+                    && p.get_status(&Task(2)).unwrap() == TaskStatus::Completed
+            })
+            .await;
+        }
+    }
 }

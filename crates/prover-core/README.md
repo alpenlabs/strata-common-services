@@ -5,6 +5,30 @@ end-to-end: assembling inputs, generating proofs (locally or via a remote
 backend), persisting receipts, and — the bulk of this crate — deciding *what to
 do when something goes wrong*.
 
+## Submission concurrency
+
+Clone one `ConcurrencyBudget` into the `ProverBuilder::concurrency_budget` of
+every prover that should share it. The budget bounds how many tasks prepare
+input and submit proofs at once:
+
+- A task takes a unit of capacity before it prepares its input. A task that
+  finds none stays a durable `Pending` row, and a later `tick()` starts it;
+  nothing waits in memory.
+- Native proving holds its unit until the blocking proof returns.
+- Remote proving releases its unit once the new proof ID is saved, or a saved ID
+  is accepted, before polling. The budget does not limit how many remote proofs
+  run at once.
+- Receipt storage and receipt hooks run without capacity.
+- `Blocked` rechecks use capacity only while they resolve input.
+
+Without a budget, every task starts on submission. PaaS rejects a budget
+without a tick interval. Each prover must own its task-key namespace; a shared
+budget does not make overlapping task stores safe.
+
+Dispatch tries `Pending` rows before due retries, each in the task store's key
+order, and skips its scans while no capacity is free. A failed task-store write
+is logged and leaves the row `Proving`, so restart recovery retries the task.
+
 ## What problem does this solve?
 
 Proof generation has a lot of moving parts: input assembly, host selection,

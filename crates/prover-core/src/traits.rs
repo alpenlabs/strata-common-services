@@ -25,6 +25,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use tokio::sync::OwnedSemaphorePermit;
 use zkaleido::{ProofReceiptWithMetadata, ZkVmProgram};
 
 use crate::{
@@ -185,9 +186,9 @@ pub trait ProofSpec: Send + Sync + 'static {
 /// record layout.
 ///
 /// Each task-key namespace must have exactly one live [`crate::Prover`] owner.
-/// Overlapping namespaces across independent provers are not supported,
-/// because startup recovery treats `Proving` rows as interrupted work. Use
-/// disjoint stores or scoped key prefixes per owner.
+/// Sharing a concurrency budget is supported; overlapping namespaces across
+/// independent provers are not, because startup recovery treats `Proving` rows
+/// as interrupted work. Use disjoint stores or scoped key prefixes per owner.
 ///
 /// Lifecycle writes are ordered but not transactional. The status goes last, so
 /// a crash or a failed write between the metadata, deadline and status writes
@@ -300,6 +301,7 @@ pub trait ReceiptHook<H: ProofSpec>: Send + Sync + 'static {
 pub(crate) struct ProveContext {
     /// Metadata from a prior run (e.g. serialized remote ProofId).
     pub(crate) saved: Option<Vec<u8>>,
+    submission_permit: Option<OwnedSemaphorePermit>,
     #[cfg(feature = "remote")]
     persist_fn: Option<Box<dyn FnOnce(Vec<u8>) + Send>>,
 }
@@ -308,6 +310,7 @@ impl fmt::Debug for ProveContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ProveContext")
             .field("saved", &self.saved.as_ref().map(|s| s.len()))
+            .field("has_submission_permit", &self.submission_permit.is_some())
             .finish()
     }
 }
@@ -316,12 +319,20 @@ impl ProveContext {
     pub(crate) fn new(
         saved: Option<Vec<u8>>,
         _persist: impl FnOnce(Vec<u8>) + Send + 'static,
+        submission_permit: Option<OwnedSemaphorePermit>,
     ) -> Self {
         Self {
             saved,
+            submission_permit,
             #[cfg(feature = "remote")]
             persist_fn: Some(Box::new(_persist)),
         }
+    }
+
+    /// Releases preparation/submission capacity before remote polling.
+    #[cfg(feature = "remote")]
+    pub(crate) fn release_submission_permit(&mut self) {
+        self.submission_permit.take();
     }
 
     /// Persist metadata for crash recovery. Call this right after obtaining

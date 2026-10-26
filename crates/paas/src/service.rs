@@ -212,14 +212,13 @@ impl<H: ProofSpec> ProverServiceBuilder<H> {
 
     /// Launch the service, returning a [`ProverHandle`] for consumer use.
     ///
-    /// Fails fast if the prover is configured with a retry policy but no
-    /// `tick_interval` — in that configuration retries would silently never
-    /// fire, which is almost certainly a misconfiguration.
+    /// Fails fast if retry or concurrency limiting is configured without a
+    /// `tick_interval`: pending work and retries need periodic dispatch.
     pub async fn launch(self, executor: &impl AsyncExecutor) -> anyhow::Result<ProverHandle<H>> {
-        if self.prover.has_retry() && self.tick_interval.is_none() {
+        if self.prover.needs_tick() && self.tick_interval.is_none() {
             anyhow::bail!(
-                "ProverServiceBuilder: retry is configured but tick_interval is unset; \
-                 retries need a tick to fire — call .tick_interval(..) or drop the retry config"
+                "ProverServiceBuilder: retry or concurrency limiting is configured but tick_interval is unset; \
+                 pending work and retries need ticks — call .tick_interval(..)"
             );
         }
 
