@@ -416,26 +416,40 @@ impl<H: ProofSpec> Prover<H> {
                 }
             }
 
+            // A saved proof ID the strategy can resume means the proof was
+            // already submitted. Poll it without preparing input that would be
+            // discarded, and free the submission capacity at once.
+            let resume = saved_metadata
+                .as_deref()
+                .is_some_and(|saved| self.strategy.can_resume(saved));
+            let permit = permit.filter(|_| !resume);
+
             // 1. Resolve input: ready, blocked on a dependency, or rejected.
-            let input = match self.spec.resolve_input(&task).await {
-                Ok(InputResolution::Ready(input)) => input,
-                Ok(InputResolution::Blocked {
+            let resolution = if resume {
+                None
+            } else {
+                Some(self.spec.resolve_input(&task).await)
+            };
+            let input = match resolution {
+                None => None,
+                Some(Ok(InputResolution::Ready(input))) => Some(input),
+                Some(Ok(InputResolution::Blocked {
                     reason,
                     recheck_after,
-                }) => {
+                })) => {
                     // Not a failure — park and recheck without notifying waiters
                     // or touching the retry budget (but bounded by the backstop).
                     let outcome = self.park_blocked(&key, reason, recheck_after, counts);
                     self.settle(&key, &task, outcome);
                     return;
                 }
-                Ok(InputResolution::Rejected { reason }) => {
+                Some(Ok(InputResolution::Rejected { reason })) => {
                     error!(%reason, "input rejected");
                     let status = TaskStatus::PermanentFailure { error: reason };
                     self.settle(&key, &task, self.write_status(&key, status));
                     return;
                 }
-                Err(e) => {
+                Some(Err(e)) => {
                     error!(%e, "resolve_input failed");
                     self.settle(&key, &task, self.handle_error(&key, &e, counts));
                     return;
@@ -459,7 +473,11 @@ impl<H: ProofSpec> Prover<H> {
             );
 
             let strategy = self.strategy.clone();
-            let prove_result = spawn_blocking(move || strategy.prove(&input, ctx)).await;
+            let prove_result = spawn_blocking(move || match input {
+                Some(input) => strategy.prove(&input, ctx),
+                None => strategy.resume(ctx),
+            })
+            .await;
 
             let receipt = match prove_result {
                 Ok(Ok(receipt)) => receipt,

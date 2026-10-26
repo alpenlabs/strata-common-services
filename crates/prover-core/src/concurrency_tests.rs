@@ -751,7 +751,8 @@ mod remote {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn remote_capacity_is_released_after_submission_or_a_valid_saved_id() {
-        // A valid saved ID resumes; malformed metadata submits a replacement.
+        // A valid saved ID resumes without input; malformed metadata submits a
+        // replacement.
         for saved in [None, Some(vec![7]), Some(Vec::new())] {
             let resumed = saved.as_ref().is_some_and(|bytes| bytes.len() == 1);
             let shared = budget(1);
@@ -788,10 +789,11 @@ mod remote {
             );
 
             // The polling task is `Proving`: a resubmit or tick leaves it alone,
-            // while a different task can submit.
+            // while a different task can submit. A resumed proof is polled
+            // without preparing input.
             p.submit(Task(1)).await.unwrap();
             p.tick().await;
-            assert_eq!(entered.load(Ordering::SeqCst), 1);
+            assert_eq!(entered.load(Ordering::SeqCst), usize::from(!resumed));
             p.submit(Task(2)).await.unwrap();
             until(|| host.polls.load(Ordering::SeqCst) == 2).await;
             assert_eq!(

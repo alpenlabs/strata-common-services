@@ -204,6 +204,28 @@ where
                 .await
         })
     }
+
+    fn can_resume(&self, saved: &[u8]) -> bool {
+        Host::ProofId::try_from(saved.to_vec()).is_ok()
+    }
+
+    fn resume(&self, ctx: ProveContext) -> ProverResult<ProofReceiptWithMetadata> {
+        let Some(proof_id) = ctx
+            .saved
+            .and_then(|saved| Host::ProofId::try_from(saved).ok())
+        else {
+            // The caller checked the metadata first; a mismatch means the saved
+            // request is unusable, so the next attempt submits afresh.
+            return Err(ProverError::resubmit("saved proof ID is not resumable"));
+        };
+        tracing::info!(%proof_id, "resuming remote proof without preparing input");
+        let host = self.host.clone();
+        let rt = self
+            .rt
+            .as_ref()
+            .expect("remote-prover runtime present outside Drop");
+        rt.block_on(self.poll_until_done::<H>(&host, &proof_id, self.poll_interval))
+    }
 }
 
 #[cfg(feature = "remote")]
