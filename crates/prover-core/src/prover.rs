@@ -1,15 +1,7 @@
 //! Core prover: fetches input via spec, proves via strategy,
 //! optionally stores receipt and calls domain hook.
 
-use std::{
-    collections::HashMap,
-    fmt, slice,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    time::Duration,
-};
+use std::{collections::HashMap, fmt, slice, sync::Arc, time::Duration};
 
 use parking_lot::Mutex;
 use tokio::{sync::oneshot, task::spawn_blocking};
@@ -41,6 +33,16 @@ type WatcherMap<T> = HashMap<Vec<u8>, Vec<oneshot::Sender<TaskResult<T>>>>;
 /// `RetryConfig::blocked_recheck_secs`; this is only a floor.
 const DEFAULT_BLOCKED_RECHECK_SECS: u64 = 10;
 
+/// State guarded by the dispatch lock, which serializes startup recovery with
+/// every task start from [`Prover::submit`] and [`Prover::tick`].
+#[derive(Debug, Default)]
+struct DispatchState {
+    /// Whether startup recovery has completed. It stays unset after a failed
+    /// recovery, so the next submit or tick runs recovery again before
+    /// starting any work.
+    recovered: bool,
+}
+
 /// Single-proof-type prover.
 ///
 /// Generic over `H` (spec) only. The zkVM host type is erased inside
@@ -54,8 +56,7 @@ pub struct Prover<H: ProofSpec> {
     receipt_hook: Option<Arc<dyn ReceiptHook<H>>>,
     /// Oneshot senders for notifying waiters when tasks reach terminal states.
     watchers: Arc<Mutex<WatcherMap<H::Task>>>,
-    /// Whether we've run recovery on startup.
-    recovered: AtomicBool,
+    dispatch: Mutex<DispatchState>,
 }
 
 impl<H: ProofSpec> fmt::Debug for Prover<H> {
@@ -78,24 +79,19 @@ impl<H: ProofSpec> fmt::Debug for Prover<H> {
 // ============================================================================
 
 impl<H: ProofSpec> Prover<H> {
-    /// Register a task and spawn background proving. Idempotent.
+    /// Registers a task and starts it. Idempotent.
+    ///
+    /// Submitting a task that already exists starts it only if it is
+    /// `Pending` or its retry is due, which is what the next tick would do.
     pub async fn submit(self: &Arc<Self>, task: H::Task) -> ProverResult<()> {
         let key: Vec<u8> = task.clone().into();
-
-        // Idempotent: if already in store, skip.
-        if self.task_store.get(&key)?.is_some() {
-            return Ok(());
+        let mut dispatch = self.dispatch.lock();
+        self.ensure_recovered(&mut dispatch)?;
+        if self.task_store.get(&key)?.is_none() {
+            self.task_store
+                .insert(TaskRecord::new(key.clone(), TaskStatus::Pending))?;
         }
-
-        self.task_store
-            .insert(TaskRecord::new(key.clone(), TaskStatus::Pending))?;
-
-        let prover = Arc::clone(self);
-        tokio::spawn(async move {
-            prover.run_task(task, key).await;
-        });
-
-        Ok(())
+        self.try_start_task(task, key)
     }
 
     /// Submit a task and block until it reaches a terminal state.
@@ -199,112 +195,111 @@ impl<H: ProofSpec> Prover<H> {
             .ok_or_else(|| ProverError::TaskNotFound(format!("{task}")))
     }
 
-    /// Scan for retriable tasks and re-spawn them. Called by PaaS on tick.
+    /// Starts `Pending` tasks and due retries and rechecks. Called by PaaS on
+    /// its tick interval.
     pub async fn tick(self: &Arc<Self>) {
-        if !self.recovered.swap(true, Ordering::SeqCst) {
-            self.recover().await;
+        if let Err(e) = self.dispatch_tasks() {
+            warn!(%e, "failed to dispatch proof tasks; will retry next tick");
         }
+    }
 
-        let retriable = match self.task_store.list_retriable(now_secs()) {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(%e, "failed to list retriable tasks");
-                return;
-            }
-        };
-        for record in retriable {
+    /// Starts runnable tasks.
+    ///
+    /// The order is not a priority policy. `Pending` rows are tried before due
+    /// `TransientFailure` and `Blocked` rows, each group in the task store's
+    /// listing order (key order for the sled and MDBX stores, where EE chunk
+    /// keys are block hashes rather than chain order).
+    ///
+    /// A failure to start one row is logged and does not stop the others.
+    fn dispatch_tasks(self: &Arc<Self>) -> ProverResult<()> {
+        let mut dispatch = self.dispatch.lock();
+        self.ensure_recovered(&mut dispatch)?;
+        let mut runnable = self.task_store.list_unfinished()?;
+        runnable.retain(|record| matches!(record.status(), TaskStatus::Pending));
+        runnable.extend(self.task_store.list_retriable(now_secs())?);
+        for record in runnable {
             let key = record.key().to_vec();
             if let Some(task) = decode_task_key::<H>(&key) {
-                let prover = Arc::clone(self);
-                tokio::spawn(async move {
-                    prover.run_task(task, key).await;
-                });
+                if let Err(e) = self.try_start_task(task, key) {
+                    warn!(%e, key = ?record.key(), "failed to start proof task; will retry next tick");
+                }
             }
         }
+        Ok(())
     }
 
-    /// Re-spawn every unfinished task on startup — anything not yet terminal
-    /// (Pending or Proving). Before this change we only re-picked in-progress
-    /// work, so a crash between `submit`'s db insert and the spawn would
-    /// leave a task stuck in Pending forever.
+    /// Runs startup recovery once, before any task starts.
     ///
-    /// A task found in `Proving` is one whose previous attempt died
-    /// abnormally — the process was killed (OOM, SIGKILL, panic) before any
-    /// error path could run. In that case no `schedule_retry` ever happened,
-    /// so the retry counter would otherwise stay at its pre-attempt value
-    /// forever and the same crash-inducing task would re-run indefinitely.
-    /// To bound this, recovery treats the dead attempt as a synthetic
-    /// transient failure: bump the counter and either schedule a normal
-    /// retry or, if `max_retries` is exhausted, mark `PermanentFailure` and
-    /// skip the spawn.
-    async fn recover(self: &Arc<Self>) {
-        let unfinished = match self.task_store.list_unfinished() {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(%e, "failed to list unfinished tasks during recovery");
-                return;
-            }
-        };
-        if unfinished.is_empty() {
-            return;
+    /// A `Proving` row found here belongs to an attempt that died with the
+    /// previous process (OOM, SIGKILL, panic) before any error path could run.
+    /// Recovery counts that death as a resume-class failure, so a task that
+    /// keeps killing the process cannot rerun forever: it gets a retry after
+    /// backoff, or `PermanentFailure` once `max_retries` is spent. `Pending`
+    /// rows need nothing here; dispatch starts them.
+    ///
+    /// A failed scan leaves recovery incomplete, and the next submit or tick
+    /// runs it again before starting any work.
+    fn ensure_recovered(&self, dispatch: &mut DispatchState) -> ProverResult<()> {
+        if dispatch.recovered {
+            return Ok(());
         }
-        info!(count = unfinished.len(), "recovering unfinished tasks");
-        for record in unfinished {
-            let key = record.key().to_vec();
-            let Some(task) = decode_task_key::<H>(&key) else {
+        for record in self.task_store.list_unfinished()? {
+            let TaskStatus::Proving { counts } = record.status() else {
                 continue;
             };
-
-            if let TaskStatus::Proving { counts } = record.status() {
-                // A crash mid-prove is resume-class. Route it through
-                // `schedule_retry`, which bumps `retry` (preserving the other
-                // counters), applies backoff (a *future* `retry_after`), and
-                // either parks it as `TransientFailure` or marks
-                // `PermanentFailure` when the budget is exhausted.
-                //
-                // Crucially we do NOT spawn `run_task` here. `schedule_retry`
-                // leaves a future `retry_after`, so the `list_retriable(now)`
-                // scan later in this same `tick()` won't match it, and the
-                // scanner re-spawns it when the backoff elapses. Spawning here
-                // *and* leaving it retriable is exactly the double-spawn that a
-                // stale (already-elapsed) `retry_after` used to cause.
-                warn!(
-                    %task,
-                    retry_count = counts.retry + 1,
-                    "task died mid-Proving; scheduling resume-class retry"
-                );
-                let status = self.schedule_retry(&key, "process died mid-Proving", *counts, false);
-                // If the budget was exhausted, `schedule_retry` marked it
-                // `PermanentFailure`; notify waiters so they don't hang.
-                self.notify(&key, &task, &status);
-                continue;
+            let key = record.key();
+            warn!(
+                ?key,
+                retry_count = counts.retry.saturating_add(1),
+                "task died mid-Proving; scheduling resume-class retry"
+            );
+            let status = self.schedule_retry(key, "process died mid-Proving", *counts, false);
+            if let Some(task) = decode_task_key::<H>(key) {
+                self.notify(key, &task, &status);
             }
-
-            // Pending tasks: never scanned by `list_retriable` (not
-            // `wants_rescan`), so spawn them directly to resume proving.
-            let prover = Arc::clone(self);
-            tokio::spawn(async move {
-                prover.run_task(task, key).await;
-            });
         }
+        dispatch.recovered = true;
+        Ok(())
     }
 
-    /// Read the persisted [`AttemptCounts`] for a task, or all-zero for a
-    /// `Pending` or absent record.
+    /// Starts `task` if its row is runnable.
     ///
-    /// Snapshotted at the top of [`Self::run_task`] before the `Proving`
-    /// overwrite discards the prior status, so the retry/resubmit/recheck
-    /// counters all survive the `Blocked ↔ Proving ↔ TransientFailure`
-    /// transitions instead of any of them resetting to zero.
-    fn read_attempt_counts(&self, key: &[u8]) -> AttemptCounts {
-        self.task_store
-            .get(key)
-            .ok()
-            .flatten()
-            .map_or(AttemptCounts::default(), |r| r.status().counts())
+    /// Called with the dispatch lock held, so the row is `Proving` before any
+    /// other caller can see it as runnable.
+    fn try_start_task(self: &Arc<Self>, task: H::Task, key: Vec<u8>) -> ProverResult<()> {
+        let Some(record) = self.task_store.get(&key)? else {
+            return Ok(());
+        };
+        let status = record.status();
+        let runnable = matches!(status, TaskStatus::Pending)
+            || (status.wants_rescan()
+                && record.retry_after_secs().is_some_and(|at| at <= now_secs()));
+        if !runnable {
+            return Ok(());
+        }
+        // The status carries the attempt counters, so they survive a crash
+        // that recovery later counts as a failed attempt.
+        self.task_store.update_status(
+            &key,
+            TaskStatus::Proving {
+                counts: status.counts(),
+            },
+        )?;
+        let prover = Arc::clone(self);
+        tokio::spawn(async move {
+            prover.run_task(task, key, record).await;
+        });
+        Ok(())
     }
 
-    async fn run_task(&self, task: H::Task, key: Vec<u8>) {
+    /// Runs one attempt of a task that dispatch has marked `Proving`.
+    ///
+    /// `record` is the row as dispatch found it, before the `Proving`
+    /// overwrite, so it still carries the attempt counters and any saved remote
+    /// proof ID.
+    async fn run_task(&self, task: H::Task, key: Vec<u8>, record: TaskRecord) {
+        let counts = record.status().counts();
+        let saved_metadata = record.metadata().map(<[u8]>::to_vec);
         let span = info_span!("prove", task = %task);
 
         async {
@@ -320,7 +315,6 @@ impl<H: ProofSpec> Prover<H> {
                         if let Some(hook) = &self.receipt_hook {
                             if let Err(e) = hook.on_receipt(&task, &receipt).await {
                                 error!(%e, "receipt hook failed (checkpoint path)");
-                                let counts = self.read_attempt_counts(&key);
                                 let status = self.handle_error(&key, &e, counts);
                                 self.notify(&key, &task, &status);
                                 return;
@@ -340,25 +334,12 @@ impl<H: ProofSpec> Prover<H> {
                         // success. Classify it (Storage -> RetryResume) and
                         // retry the checkpoint instead.
                         error!(%e, "receipt store read failed on checkpoint path");
-                        let counts = self.read_attempt_counts(&key);
                         let status = self.handle_error(&key, &e, counts);
                         self.notify(&key, &task, &status);
                         return;
                     }
                 }
             }
-
-            // Snapshot the attempt counters from the persisted record BEFORE
-            // flipping status to `Proving`, which overwrites the prior status.
-            // Carrying all three (retry/resubmit/recheck) forward is what keeps
-            // the budgets bounded across the Blocked ↔ Proving ↔ TransientFailure
-            // transitions; `schedule_retry`/`park_blocked` can't re-read them
-            // after the overwrite, and `recover` needs them to survive a crash.
-            let counts = self.read_attempt_counts(&key);
-
-            let _ = self
-                .task_store
-                .update_status(&key, TaskStatus::Proving { counts });
 
             // 1. Resolve input: ready, blocked on a dependency, or rejected.
             let input = match self.spec.resolve_input(&task).await {
@@ -388,12 +369,6 @@ impl<H: ProofSpec> Prover<H> {
             };
 
             // 2. Prove (blocking — strategy handles native vs remote)
-            let saved_metadata = self
-                .task_store
-                .get(&key)
-                .ok()
-                .flatten()
-                .and_then(|r| r.metadata().map(|m| m.to_vec()));
             let store = self.task_store.clone();
             let persist_key = key.clone();
             let ctx = ProveContext::new(saved_metadata, move |data| {
@@ -689,6 +664,8 @@ impl<H: ProofSpec> ProverBuilder<H> {
         }
     }
 
+    /// Sets storage for the task-key namespace this prover exclusively owns.
+    /// See [`TaskStore`] for the ownership requirement.
     pub fn task_store(mut self, store: impl TaskStore + 'static) -> Self {
         self.task_store = Some(Arc::new(store));
         self
@@ -765,7 +742,7 @@ impl<H: ProofSpec> ProverBuilder<H> {
             receipt_store: self.receipt_store,
             receipt_hook: self.receipt_hook,
             watchers: Arc::new(Mutex::new(HashMap::new())),
-            recovered: AtomicBool::new(false),
+            dispatch: Mutex::new(DispatchState::default()),
         }
     }
 }
@@ -775,3 +752,7 @@ impl<H: ProofSpec> fmt::Debug for ProverBuilder<H> {
         f.debug_struct("ProverBuilder").finish()
     }
 }
+
+#[cfg(test)]
+#[path = "concurrency_tests.rs"]
+mod concurrency_tests;

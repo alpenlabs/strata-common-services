@@ -54,9 +54,10 @@ let handle = ProverServiceBuilder::new(prover)
 The tick interval controls how often PaaS calls `prover.tick()`. The tick is the
 heartbeat for everything time-driven in prover-core: re-spawning tasks whose
 backoff has elapsed (`TransientFailure`), rechecking tasks waiting on a
-dependency (`Blocked`), and one-shot startup crash recovery. If you don't set
-one, the service runs in command-only mode — no retries, no rechecks, no
-recovery; good for one-shot provers in tests. (Launching with a retry config but
+dependency (`Blocked`), and starting `Pending` tasks left by an earlier
+process. Startup recovery runs before the first submission or tick. Without a
+tick interval, command-only mode has no periodic retry, recheck, or backlog
+dispatch; good for one-shot provers in tests. (Launching with a retry config but
 no tick interval is rejected — retries would never fire.)
 
 `RetryConfig` carries the full retry policy — resume/resubmit budgets, jittered

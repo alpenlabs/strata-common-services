@@ -183,6 +183,11 @@ pub trait ProofSpec: Send + Sync + 'static {
 /// errors to callers instead of silently discarding them. Timestamp
 /// arguments are `u64` seconds since UNIX epoch, matching the stored
 /// record layout.
+///
+/// Each task-key namespace must have exactly one live [`crate::Prover`] owner.
+/// Overlapping namespaces across independent provers are not supported,
+/// because startup recovery treats `Proving` rows as interrupted work. Use
+/// disjoint stores or scoped key prefixes per owner.
 pub trait TaskStore: Send + Sync + 'static {
     fn get(&self, key: &[u8]) -> ProverResult<Option<TaskRecord>>;
     fn insert(&self, record: TaskRecord) -> ProverResult<()>;
