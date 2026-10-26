@@ -658,6 +658,69 @@ async fn cancelling_the_async_attempt_keeps_capacity_until_the_blocking_proof_ex
     until(|| shared.try_acquire().is_some()).await;
 }
 
+/// Panics while resolving input, as a bug in a consumer's spec would.
+struct PanicSpec;
+#[async_trait]
+impl ProofSpec for PanicSpec {
+    type Task = Task;
+    type Program = Program;
+    async fn resolve_input(&self, _: &Task) -> ProverResult<InputResolution<()>> {
+        panic!("bug in input assembly");
+    }
+}
+impl ProveStrategy<PanicSpec> for Strategy {
+    fn prove(&self, _: &(), _ctx: ProveContext) -> ProverResult<ProofReceiptWithMetadata> {
+        Ok(ProofReceiptWithMetadata::default())
+    }
+}
+fn panicking_prover(store: Arc<InMemoryTaskStore>, retry: RetryConfig) -> Arc<Prover<PanicSpec>> {
+    Arc::new(
+        ProverBuilder::new(PanicSpec)
+            .task_store(store)
+            .retry(retry)
+            .build(Arc::new(Strategy)),
+    )
+}
+
+#[tokio::test]
+async fn panicked_attempt_retries_like_a_crash() {
+    let store = Arc::new(InMemoryTaskStore::new());
+    let p = panicking_prover(store.clone(), RetryConfig::default());
+    p.submit(Task(1)).await.unwrap();
+    until(|| !p.get_status(&Task(1)).unwrap().is_in_progress()).await;
+    let status = p.get_status(&Task(1)).unwrap();
+    assert!(matches!(status, TaskStatus::TransientFailure { .. }));
+    assert_eq!(status.counts().retry, 1);
+    // A retry is not terminal, so waiters keep waiting.
+    let waited = timeout(Duration::from_millis(200), p.wait_for_tasks(&[Task(1)])).await;
+    assert!(waited.is_err());
+
+    // The task stays dispatchable: once due, it runs (and panics) again.
+    store.set_retry_after(&[1], 0).unwrap();
+    p.tick().await;
+    until(|| p.get_status(&Task(1)).unwrap().counts().retry == 2).await;
+}
+
+#[tokio::test]
+async fn panicking_task_fails_once_its_retry_budget_is_spent() {
+    let store = Arc::new(InMemoryTaskStore::new());
+    let retry = RetryConfig {
+        max_retries: 1,
+        ..RetryConfig::default()
+    };
+    let p = panicking_prover(store, retry);
+    p.submit(Task(1)).await.unwrap();
+    let results = timeout(Duration::from_secs(5), p.wait_for_tasks(&[Task(1)]))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(results[0].is_failed());
+    assert!(matches!(
+        p.get_status(&Task(1)).unwrap(),
+        TaskStatus::PermanentFailure { .. }
+    ));
+}
+
 #[cfg(feature = "remote")]
 mod remote {
     use serde::{de::DeserializeOwned, Serialize};
