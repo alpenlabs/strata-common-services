@@ -1,0 +1,74 @@
+name: AI Security Review
+
+# Review behavior lives in https://github.com/alpenlabs/actions/tree/v1.2.0/ai-security-review.
+# ALPEN_ACTIONS_READ_TOKEN needs Contents: read access to the internal actions repository.
+# Also configure CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY for the shared action.
+# ALPEN_PRODUCT_READ_TOKEN (Contents: read on alpenlabs/product) loads PRDs; without it the review skips them.
+# Add require-repo-context: true once ai-security-review/context/repos/strata-common-services.md exists in alpenlabs/actions.
+# Keep pull_request: pull_request_target would expose secrets to untrusted PR content.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number to review
+        required: true
+        type: number
+
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  security-review:
+    if: >-
+      github.actor != 'dependabot[bot]' &&
+      (github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.login != 'dependabot[bot]'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # Preserve the automatic trigger boundary for manual runs too.
+      - name: Validate manually selected PR
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ inputs.pr_number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh pr view "$PR" --repo "$REPO" --json isCrossRepository,author |
+            jq -e '.isCrossRepository == false and (.author.login != "dependabot" and .author.login != "dependabot[bot]")'
+
+      - name: Checkout PR head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || format('refs/pull/{0}/head', inputs.pr_number) }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout shared actions
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: alpenlabs/actions
+          ref: 1e30c71ed3566bc0405118276357aff8cf61809f # v1.2.0
+          token: ${{ secrets.ALPEN_ACTIONS_READ_TOKEN }}
+          path: .alpen-actions
+          persist-credentials: false
+
+      - name: Review pull request
+        # This action comes from the authenticated checkout, not the caller repository.
+        uses: ./.alpen-actions/ai-security-review # zizmor: ignore[self-repository]
+        with:
+          pr-number: ${{ github.event.pull_request.number || inputs.pr_number }}
+          claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          product-read-token: ${{ secrets.ALPEN_PRODUCT_READ_TOKEN }}
