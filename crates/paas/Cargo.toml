@@ -1,0 +1,23 @@
+[package]
+name = "strata-paas"
+version = "0.1.0"
+edition = "2021"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+remote = ["strata-prover-core/remote"]
+
+[dependencies]
+strata-prover-core.workspace = true
+strata-service.workspace = true
+
+anyhow.workspace = true
+serde.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+tracing.workspace = true

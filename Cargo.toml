@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/prover-core"]
+members = ["crates/paas", "crates/prover-core"]
 resolver = "2"
 
 [workspace.package]
@@ -20,10 +20,13 @@ clippy.absolute_paths = "warn"
 rustdoc.all = "warn"
 
 [workspace.dependencies]
+anyhow = "1.0.102"
 async-trait = "0.1.80"
 parking_lot = "0.12.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_bytes = "0.11.15"
+strata-prover-core = { path = "crates/prover-core" }
+strata-service = { git = "https://github.com/alpenlabs/strata-common", tag = "v0.4.0" }
 thiserror = "2.0.11"
 tokio = { version = "1.52", features = ["full"] }
 tracing = "0.1"
