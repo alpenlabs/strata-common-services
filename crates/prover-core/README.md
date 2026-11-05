@@ -18,7 +18,8 @@ input and submit proofs at once:
 - Remote proving releases its unit once the new proof ID is saved, before
   polling. A task that resumes a saved proof ID skips input preparation and
   releases its unit at once. The budget does not limit how many remote proofs
-  run at once.
+  run at once, but a polling proof keeps no input in memory: the task drops it
+  once the proof is submitted.
 - Receipt storage and receipt hooks run without capacity.
 - `Blocked` rechecks use capacity only while they resolve input.
 

@@ -578,7 +578,7 @@ impl<H: ProofSpec> Prover<H> {
 
             let strategy = self.strategy.clone();
             let prove_result = spawn_blocking(move || match input {
-                Some(input) => strategy.prove(&input, ctx),
+                Some(input) => strategy.prove(input, ctx),
                 None => strategy.resume(ctx),
             })
             .await;
