@@ -36,5 +36,7 @@ jobs:
 
       - name: Check docs leaving the dependencies out
         env:
-          RUSTDOCFLAGS: -A rustdoc::private-doc-tests -D warnings
-        run: cargo doc --no-deps
+          # generic_const_exprs is not yet supported by the globally enabled next-generation trait
+          # solver. See https://github.com/rust-lang/rust/issues/160895.
+          RUSTDOCFLAGS: -Znext-solver=coherence -A rustdoc::private-doc-tests -D warnings
+        run: cargo doc --workspace --all-features --no-deps
