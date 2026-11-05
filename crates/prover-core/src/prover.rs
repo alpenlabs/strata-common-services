@@ -18,7 +18,7 @@ use crate::{
     error::{FailureAction, ProverError, ProverResult},
     in_memory::InMemoryTaskStore,
     strategy::NativeStrategy,
-    task::{now_secs, AttemptCounts, TaskRecord, TaskResult, TaskStatus},
+    task::{now_secs, AttemptCounts, ResetOutcome, TaskRecord, TaskResult, TaskStatus},
     traits::{
         InputResolution, ProofSpec, ProveContext, ProveStrategy, ReceiptHook, ReceiptStore,
         TaskStore,
@@ -149,28 +149,28 @@ impl<H: ProofSpec> Prover<H> {
     /// once `Pending` is written; if the dispatch that follows finds no capacity or fails,
     /// [`Self::tick`] starts the task instead.
     ///
-    /// Returns the failure reason the reset cleared.
-    pub async fn reset_permanent_failure(self: &Arc<Self>, task: H::Task) -> ProverResult<String> {
+    /// A task in any other state, or no task at all, is left unchanged and reported in the
+    /// [`ResetOutcome`]; errors are only storage or recovery failures.
+    pub async fn reset_permanent_failure(
+        self: &Arc<Self>,
+        task: H::Task,
+    ) -> ProverResult<ResetOutcome> {
         let key: Vec<u8> = task.clone().into();
         let mut dispatch = self.dispatch.lock();
         self.ensure_recovered(&mut dispatch)?;
-        let record = self
-            .task_store
-            .get(&key)?
-            .ok_or_else(|| ProverError::TaskNotFound(task.to_string()))?;
-        let TaskStatus::PermanentFailure { error } = record.status() else {
-            return Err(ProverError::NotPermanentlyFailed {
-                task: task.to_string(),
-                status: format!("{:?}", record.status()),
-            });
+        let Some(record) = self.task_store.get(&key)? else {
+            return Ok(ResetOutcome::NotFound);
         };
-        let error = error.clone();
+        let TaskStatus::PermanentFailure { error } = record.status() else {
+            return Ok(ResetOutcome::NotPermanentlyFailed(record.status().clone()));
+        };
+        let cleared_error = error.clone();
         self.task_store.update_status(&key, TaskStatus::Pending)?;
-        warn!(%task, previous_error = %error, "reset PermanentFailure task to Pending");
+        warn!(%task, previous_error = %cleared_error, "reset PermanentFailure task to Pending");
         if let Err(e) = self.try_start_task(task, key) {
             warn!(%e, "failed to dispatch reset task; next tick starts it");
         }
-        Ok(error)
+        Ok(ResetOutcome::Reset { cleared_error })
     }
 
     /// Submit a task and block until it reaches a terminal state.

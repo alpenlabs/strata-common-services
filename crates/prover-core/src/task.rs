@@ -111,6 +111,20 @@ impl TaskStatus {
     }
 }
 
+/// What an operator reset did to a task. Returned by `Prover::reset_permanent_failure`.
+///
+/// Only a `PermanentFailure` task is reset. The other variants are expected outcomes, not
+/// errors: a caller resetting every task of a batch skips them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResetOutcome {
+    /// The task was in `PermanentFailure` and is `Pending` again. Carries the cleared reason.
+    Reset { cleared_error: String },
+    /// The task is not in `PermanentFailure`, so nothing changed. Carries its current status.
+    NotPermanentlyFailed(TaskStatus),
+    /// No task with this key exists.
+    NotFound,
+}
+
 /// Outcome of a completed (or failed) task. Returned by `execute` and `wait_for_tasks`.
 #[derive(Debug, Clone)]
 pub enum TaskResult<T> {

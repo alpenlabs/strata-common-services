@@ -6,7 +6,7 @@
 
 use std::{fmt, marker::PhantomData, sync::Arc, time::Duration};
 
-use strata_prover_core::{ProofSpec, Prover, ProverResult, TaskResult};
+use strata_prover_core::{ProofSpec, Prover, ProverResult, ResetOutcome, TaskResult};
 
 /// Bounds a task payload must satisfy to travel over the paas command
 /// channel. Blanket-impl'd for every type that meets them, so
@@ -38,7 +38,7 @@ pub(crate) enum Cmd<T: CmdTask> {
     },
     ResetPermanentFailure {
         task: T,
-        completion: CommandCompletionSender<ProverResult<String>>,
+        completion: CommandCompletionSender<ProverResult<ResetOutcome>>,
     },
 }
 

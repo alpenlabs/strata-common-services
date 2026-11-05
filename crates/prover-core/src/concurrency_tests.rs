@@ -734,8 +734,12 @@ async fn reset_permanent_failure_restarts_the_task() {
         .insert(TaskRecord::new(vec![1], permanent_failure("bad witness")))
         .unwrap();
     let (p, entered, gate) = build_limited(budget(1), store, false);
-    let cleared = p.reset_permanent_failure(Task(1)).await.unwrap();
-    assert_eq!(cleared, "bad witness");
+    assert_eq!(
+        p.reset_permanent_failure(Task(1)).await.unwrap(),
+        ResetOutcome::Reset {
+            cleared_error: "bad witness".into()
+        }
+    );
     until(|| entered.load(Ordering::SeqCst) == 1).await;
     gate.add_permits(1);
     until(|| p.get_status(&Task(1)).unwrap() == TaskStatus::Completed).await;
@@ -748,15 +752,15 @@ async fn reset_permanent_failure_refuses_other_rows() {
         .insert(TaskRecord::new(vec![1], TaskStatus::Completed))
         .unwrap();
     let (p, entered, _) = build_limited(budget(1), store, false);
-    assert!(matches!(
-        p.reset_permanent_failure(Task(1)).await,
-        Err(ProverError::NotPermanentlyFailed { .. })
-    ));
+    assert_eq!(
+        p.reset_permanent_failure(Task(1)).await.unwrap(),
+        ResetOutcome::NotPermanentlyFailed(TaskStatus::Completed)
+    );
     assert_eq!(p.get_status(&Task(1)).unwrap(), TaskStatus::Completed);
-    assert!(matches!(
-        p.reset_permanent_failure(Task(2)).await,
-        Err(ProverError::TaskNotFound(_))
-    ));
+    assert_eq!(
+        p.reset_permanent_failure(Task(2)).await.unwrap(),
+        ResetOutcome::NotFound
+    );
     assert_eq!(entered.load(Ordering::SeqCst), 0);
 }
 
@@ -768,8 +772,8 @@ async fn reset_permanent_failure_refuses_a_task_in_flight() {
     until(|| entered.load(Ordering::SeqCst) == 1).await;
     // A healthy attempt in flight is not a failure.
     assert!(matches!(
-        p.reset_permanent_failure(Task(1)).await,
-        Err(ProverError::NotPermanentlyFailed { .. })
+        p.reset_permanent_failure(Task(1)).await.unwrap(),
+        ResetOutcome::NotPermanentlyFailed(TaskStatus::Proving { .. })
     ));
     gate.add_permits(1);
     until(|| p.get_status(&Task(1)).unwrap() == TaskStatus::Completed).await;
@@ -788,7 +792,10 @@ async fn reset_permanent_failure_without_capacity_stays_pending_until_tick() {
     let (p, entered, gate) = build_limited(budget(1), store, false);
     p.submit(Task(1)).await.unwrap();
     until(|| entered.load(Ordering::SeqCst) == 1).await;
-    p.reset_permanent_failure(Task(2)).await.unwrap();
+    assert!(matches!(
+        p.reset_permanent_failure(Task(2)).await.unwrap(),
+        ResetOutcome::Reset { .. }
+    ));
     assert_eq!(p.get_status(&Task(2)).unwrap(), TaskStatus::Pending);
     gate.add_permits(2);
     until(|| p.get_status(&Task(1)).unwrap() == TaskStatus::Completed).await;
