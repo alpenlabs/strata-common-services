@@ -36,6 +36,10 @@ pub(crate) enum Cmd<T: CmdTask> {
         task: T,
         completion: CommandCompletionSender<ProverResult<TaskResult<T>>>,
     },
+    ResetPermanentFailure {
+        task: T,
+        completion: CommandCompletionSender<ProverResult<String>>,
+    },
 }
 
 // ============================================================================
@@ -104,6 +108,11 @@ async fn handle_cmd<H: ProofSpec>(prover: &Arc<Prover<H>>, cmd: Cmd<H::Task>) {
                     .map(|mut results| results.pop().expect("one result for one task"));
                 completion.send(result).await;
             });
+        }
+        Cmd::ResetPermanentFailure { task, completion } => {
+            trace!(?task, "handling reset command");
+            let result = prover.reset_permanent_failure(task).await;
+            completion.send(result).await;
         }
     }
 }

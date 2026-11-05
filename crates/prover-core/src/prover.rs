@@ -134,6 +134,45 @@ impl<H: ProofSpec> Prover<H> {
         self.try_start_task(task, key)
     }
 
+    /// Returns a `PermanentFailure` task to `Pending` and starts it when shared capacity is
+    /// available.
+    ///
+    /// The prover never revives a `PermanentFailure` by itself, since the failure may be correct
+    /// (a bad witness); this is the operator's manual reset. It runs under the dispatch lock, so
+    /// no submit or tick can start the task while the reset checks and rewrites its row. No live
+    /// attempt can overwrite the reset either: an attempt's terminal status is its last
+    /// task-store write, and a panicked attempt only settles a row still in its own `Proving`
+    /// status.
+    ///
+    /// The reset clears the attempt counters (a `Pending` row carries none) and keeps any saved
+    /// remote proof metadata, so the next attempt resumes the saved request. The reset is durable
+    /// once `Pending` is written; if the dispatch that follows finds no capacity or fails,
+    /// [`Self::tick`] starts the task instead.
+    ///
+    /// Returns the failure reason the reset cleared.
+    pub async fn reset_permanent_failure(self: &Arc<Self>, task: H::Task) -> ProverResult<String> {
+        let key: Vec<u8> = task.clone().into();
+        let mut dispatch = self.dispatch.lock();
+        self.ensure_recovered(&mut dispatch)?;
+        let record = self
+            .task_store
+            .get(&key)?
+            .ok_or_else(|| ProverError::TaskNotFound(task.to_string()))?;
+        let TaskStatus::PermanentFailure { error } = record.status() else {
+            return Err(ProverError::NotPermanentlyFailed {
+                task: task.to_string(),
+                status: format!("{:?}", record.status()),
+            });
+        };
+        let error = error.clone();
+        self.task_store.update_status(&key, TaskStatus::Pending)?;
+        warn!(%task, previous_error = %error, "reset PermanentFailure task to Pending");
+        if let Err(e) = self.try_start_task(task, key) {
+            warn!(%e, "failed to dispatch reset task; next tick starts it");
+        }
+        Ok(error)
+    }
+
     /// Submit a task and block until it reaches a terminal state.
     pub async fn execute(self: &Arc<Self>, task: H::Task) -> ProverResult<TaskResult<H::Task>> {
         self.submit(task.clone()).await?;

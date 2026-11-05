@@ -37,6 +37,10 @@ pub enum ProverError {
     #[error("no receipt store configured")]
     NoReceiptStore,
 
+    /// A reset targeted a task that is not in `PermanentFailure`.
+    #[error("task {task} is not in PermanentFailure: {status}")]
+    NotPermanentlyFailed { task: String, status: String },
+
     /// A proving-pipeline failure carrying its classified retry decision.
     ///
     /// Constructed via [`ProverError::transient`] / [`ProverError::resubmit`] /
@@ -102,9 +106,10 @@ impl ProverError {
         match self {
             Self::Failed { action, .. } => *action,
             Self::Storage(_) | Self::Codec(_) | Self::Command(_) => FailureAction::RetryResume,
-            Self::TaskNotFound(_) | Self::TaskAlreadyExists(_) | Self::NoReceiptStore => {
-                FailureAction::Permanent
-            }
+            Self::TaskNotFound(_)
+            | Self::TaskAlreadyExists(_)
+            | Self::NoReceiptStore
+            | Self::NotPermanentlyFailed { .. } => FailureAction::Permanent,
         }
     }
 }

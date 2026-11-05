@@ -52,6 +52,20 @@ impl<H: ProofSpec> ProverHandle<H> {
             .map_err(|e| ProverError::Command(e.to_string()))?
     }
 
+    /// Return a `PermanentFailure` task to `Pending` and restart it. Returns the cleared failure
+    /// reason.
+    ///
+    /// See [`Prover::reset_permanent_failure`] for when the reset is refused.
+    pub async fn reset_permanent_failure(&self, task: H::Task) -> ProverResult<String> {
+        self.cmd
+            .send_and_wait(|c| Cmd::ResetPermanentFailure {
+                task: task.clone(),
+                completion: c,
+            })
+            .await
+            .map_err(|e| ProverError::Command(e.to_string()))?
+    }
+
     /// Submit a task and block until it reaches a terminal state.
     pub async fn execute(&self, task: H::Task) -> ProverResult<TaskResult<H::Task>> {
         self.cmd
