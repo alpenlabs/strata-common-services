@@ -1,7 +1,14 @@
 //! Core prover: fetches input via spec, proves via strategy,
 //! optionally stores receipt and calls domain hook.
 
-use std::{collections::HashMap, fmt, num::NonZeroUsize, slice, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    num::NonZeroUsize,
+    slice,
+    sync::Arc,
+    time::Duration,
+};
 
 use parking_lot::Mutex;
 use tokio::{
@@ -77,6 +84,13 @@ struct DispatchState {
     /// recovery, so the next submit or tick runs recovery again before
     /// starting any work.
     recovered: bool,
+    /// Keys of tasks whose attempt has not fully exited.
+    ///
+    /// A claim is taken when dispatch starts an attempt and released only once
+    /// that attempt, including its panic handling, has finished. An attempt can
+    /// still notify waiters or settle a panic after its row looks terminal, so
+    /// no new attempt starts and no reset runs while the claim is held.
+    claimed: HashSet<Vec<u8>>,
 }
 
 /// Single-proof-type prover.
@@ -131,7 +145,7 @@ impl<H: ProofSpec> Prover<H> {
             self.task_store
                 .insert(TaskRecord::new(key.clone(), TaskStatus::Pending))?;
         }
-        self.try_start_task(task, key)
+        self.try_start_task(&mut dispatch, task, key)
     }
 
     /// Returns a `PermanentFailure` task to `Pending` and starts it when shared capacity is
@@ -139,10 +153,10 @@ impl<H: ProofSpec> Prover<H> {
     ///
     /// The prover never revives a `PermanentFailure` by itself, since the failure may be correct
     /// (a bad witness); this is the operator's manual reset. It runs under the dispatch lock, so
-    /// no submit or tick can start the task while the reset checks and rewrites its row. No live
-    /// attempt can overwrite the reset either: an attempt's terminal status is its last
-    /// task-store write, and a panicked attempt only settles a row still in its own `Proving`
-    /// status.
+    /// no submit or tick can start the task while the reset checks and rewrites its row. A task
+    /// whose failed attempt has not fully exited is left alone and reported as
+    /// [`ResetOutcome::AttemptStillRunning`]: that attempt may still notify waiters with its
+    /// failure or settle a panic, which would hit the restarted task. Retrying shortly succeeds.
     ///
     /// The reset clears the attempt counters (a `Pending` row carries none) and keeps any saved
     /// remote proof metadata, so the next attempt resumes the saved request. The reset is durable
@@ -164,10 +178,13 @@ impl<H: ProofSpec> Prover<H> {
         let TaskStatus::PermanentFailure { error } = record.status() else {
             return Ok(ResetOutcome::NotPermanentlyFailed(record.status().clone()));
         };
+        if dispatch.claimed.contains(&key) {
+            return Ok(ResetOutcome::AttemptStillRunning);
+        }
         let cleared_error = error.clone();
         self.task_store.update_status(&key, TaskStatus::Pending)?;
         warn!(%task, previous_error = %cleared_error, "reset PermanentFailure task to Pending");
-        if let Err(e) = self.try_start_task(task, key) {
+        if let Err(e) = self.try_start_task(&mut dispatch, task, key) {
             warn!(%e, "failed to dispatch reset task; next tick starts it");
         }
         Ok(ResetOutcome::Reset { cleared_error })
@@ -315,7 +332,7 @@ impl<H: ProofSpec> Prover<H> {
             }
             let key = record.key().to_vec();
             if let Some(task) = decode_task_key::<H>(&key) {
-                if let Err(e) = self.try_start_task(task, key) {
+                if let Err(e) = self.try_start_task(&mut dispatch, task, key) {
                     warn!(%e, key = ?record.key(), "failed to start proof task; will retry next tick");
                 }
             }
@@ -366,8 +383,17 @@ impl<H: ProofSpec> Prover<H> {
     /// Starts `task` if its row is runnable and capacity allows.
     ///
     /// Called with the dispatch lock held, so the row is `Proving` before any
-    /// other caller can see it as runnable.
-    fn try_start_task(self: &Arc<Self>, task: H::Task, key: Vec<u8>) -> ProverResult<()> {
+    /// other caller can see it as runnable. A task whose previous attempt still
+    /// holds its claim is skipped; a later submit or tick starts it.
+    fn try_start_task(
+        self: &Arc<Self>,
+        dispatch: &mut DispatchState,
+        task: H::Task,
+        key: Vec<u8>,
+    ) -> ProverResult<()> {
+        if dispatch.claimed.contains(&key) {
+            return Ok(());
+        }
         let Some(record) = self.task_store.get(&key)? else {
             return Ok(());
         };
@@ -390,6 +416,7 @@ impl<H: ProofSpec> Prover<H> {
         let counts = status.counts();
         self.task_store
             .update_status(&key, TaskStatus::Proving { counts })?;
+        dispatch.claimed.insert(key.clone());
         let attempt = tokio::spawn({
             let prover = Arc::clone(self);
             let (task, key) = (task.clone(), key.clone());
@@ -404,6 +431,7 @@ impl<H: ProofSpec> Prover<H> {
                     prover.settle_panicked_attempt(&task, &key, counts);
                 }
             }
+            prover.dispatch.lock().claimed.remove(&key);
         });
         Ok(())
     }

@@ -121,6 +121,9 @@ pub enum ResetOutcome {
     Reset { cleared_error: String },
     /// The task is not in `PermanentFailure`, so nothing changed. Carries its current status.
     NotPermanentlyFailed(TaskStatus),
+    /// The task is in `PermanentFailure`, but the attempt that failed it has not fully exited,
+    /// so nothing changed. Retrying the reset shortly succeeds.
+    AttemptStillRunning,
     /// No task with this key exists.
     NotFound,
 }

@@ -1,4 +1,7 @@
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::{
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    thread,
+};
 
 use async_trait::async_trait;
 use tokio::{sync::Semaphore, task::yield_now, time::timeout};
@@ -804,6 +807,159 @@ async fn reset_permanent_failure_without_capacity_stays_pending_until_tick() {
     })
     .await;
     assert_eq!(entered.load(Ordering::SeqCst), 2);
+}
+
+/// Fails its first input resolution permanently, then succeeds.
+struct FailOnceSpec {
+    calls: AtomicUsize,
+}
+#[async_trait]
+impl ProofSpec for FailOnceSpec {
+    type Task = Task;
+    type Program = Program;
+    async fn resolve_input(&self, _: &Task) -> ProverResult<InputResolution<()>> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(ProverError::permanent("bad witness"));
+        }
+        Ok(InputResolution::Ready(()))
+    }
+}
+impl ProveStrategy<FailOnceSpec> for Strategy {
+    fn prove(&self, _: &(), _ctx: ProveContext) -> ProverResult<ProofReceiptWithMetadata> {
+        Ok(ProofReceiptWithMetadata::default())
+    }
+}
+
+/// Holds an attempt between its `PermanentFailure` write and its exit.
+///
+/// After the write commits, the store either pauses the writer, or panics and
+/// then pauses the next read, which is the panic handler's. A paused call sets
+/// `reached` and blocks its worker thread until `release` is set.
+#[derive(Default)]
+struct TerminalHookStore {
+    inner: InMemoryTaskStore,
+    pause_after_failure: AtomicBool,
+    panic_after_failure: AtomicBool,
+    pause_next_get: AtomicBool,
+    reached: AtomicBool,
+    release: AtomicBool,
+}
+impl TerminalHookStore {
+    fn pause(&self) {
+        self.reached.store(true, Ordering::SeqCst);
+        while !self.release.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+impl TaskStore for TerminalHookStore {
+    fn get(&self, k: &[u8]) -> ProverResult<Option<TaskRecord>> {
+        if self.pause_next_get.swap(false, Ordering::SeqCst) {
+            self.pause();
+        }
+        self.inner.get(k)
+    }
+    fn insert(&self, r: TaskRecord) -> ProverResult<()> {
+        self.inner.insert(r)
+    }
+    fn update_status(&self, k: &[u8], s: TaskStatus) -> ProverResult<()> {
+        let failure = matches!(s, TaskStatus::PermanentFailure { .. });
+        self.inner.update_status(k, s)?;
+        if failure && self.pause_after_failure.swap(false, Ordering::SeqCst) {
+            self.pause();
+        }
+        if failure && self.panic_after_failure.swap(false, Ordering::SeqCst) {
+            self.pause_next_get.store(true, Ordering::SeqCst);
+            panic!("store bug after committing the failure");
+        }
+        Ok(())
+    }
+    fn set_retry_after(&self, k: &[u8], t: u64) -> ProverResult<()> {
+        self.inner.set_retry_after(k, t)
+    }
+    fn set_metadata(&self, k: &[u8], d: Vec<u8>) -> ProverResult<()> {
+        self.inner.set_metadata(k, d)
+    }
+    fn clear_metadata(&self, k: &[u8]) -> ProverResult<()> {
+        self.inner.clear_metadata(k)
+    }
+    fn list_retriable(&self, t: u64) -> ProverResult<Vec<TaskRecord>> {
+        self.inner.list_retriable(t)
+    }
+    fn list_unfinished(&self) -> ProverResult<Vec<TaskRecord>> {
+        self.inner.list_unfinished()
+    }
+    fn count(&self) -> ProverResult<usize> {
+        self.inner.count()
+    }
+}
+
+fn fail_once_prover(store: Arc<TerminalHookStore>) -> Arc<Prover<FailOnceSpec>> {
+    let spec = FailOnceSpec {
+        calls: AtomicUsize::new(0),
+    };
+    Arc::new(
+        ProverBuilder::new(spec)
+            .task_store(store)
+            .build(Arc::new(Strategy)),
+    )
+}
+
+/// Resets `task` once its failed attempt has exited.
+async fn reset_when_attempt_exits(p: &Arc<Prover<FailOnceSpec>>, task: u8) -> ResetOutcome {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            match p.reset_permanent_failure(Task(task)).await.unwrap() {
+                ResetOutcome::AttemptStillRunning => yield_now().await,
+                outcome => return outcome,
+            }
+        }
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reset_waits_until_the_failed_attempt_has_notified_waiters() {
+    let store = Arc::new(TerminalHookStore::default());
+    store.pause_after_failure.store(true, Ordering::SeqCst);
+    let p = fail_once_prover(store.clone());
+    p.submit(Task(1)).await.unwrap();
+    until(|| store.reached.load(Ordering::SeqCst)).await;
+    // The row reads PermanentFailure, but its attempt has not notified waiters
+    // yet. A reset now would let that failure reach the restarted task's waiters.
+    let early = p.reset_permanent_failure(Task(1)).await.unwrap();
+    store.release.store(true, Ordering::SeqCst);
+    assert_eq!(early, ResetOutcome::AttemptStillRunning);
+    assert!(matches!(
+        reset_when_attempt_exits(&p, 1).await,
+        ResetOutcome::Reset { .. }
+    ));
+    let results = timeout(Duration::from_secs(5), p.wait_for_tasks(&[Task(1)]))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(results[0].is_completed());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reset_waits_until_a_panicked_attempt_is_settled() {
+    let store = Arc::new(TerminalHookStore::default());
+    store.panic_after_failure.store(true, Ordering::SeqCst);
+    let p = fail_once_prover(store.clone());
+    p.submit(Task(1)).await.unwrap();
+    // The attempt panicked after its failure committed; its panic handler is
+    // paused before it reads the row. The restarted attempt would carry the
+    // same `Proving` counters, so the handler would mistake it for its own.
+    until(|| store.reached.load(Ordering::SeqCst)).await;
+    let early = p.reset_permanent_failure(Task(1)).await.unwrap();
+    store.release.store(true, Ordering::SeqCst);
+    assert_eq!(early, ResetOutcome::AttemptStillRunning);
+    assert!(matches!(
+        reset_when_attempt_exits(&p, 1).await,
+        ResetOutcome::Reset { .. }
+    ));
+    until(|| p.get_status(&Task(1)).unwrap() == TaskStatus::Completed).await;
 }
 
 #[cfg(feature = "remote")]
