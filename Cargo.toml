@@ -1,20 +1,11 @@
 [workspace]
-members = ["crates/foo"]
+members = ["crates/prover-core"]
 resolver = "2"
 
 [workspace.package]
-version = "0.0.0" # CHANGEME
-edition = "2024" # CHANGEME
-authors = [
-  "John Doe <noreply@alpenlabs.io>",  # CHANGEME
-  "Janet Doe <noreply@alpenlabs.io>", # CHANGEME
-]
-description = "Alpen Rust Workspace Template" # CHANGEME
-license = "MIT OR Apache-2.0" # CHANGEME
-readme = "README.md"
-repository = "https://github.com/alpenlabs/rust-template-workspace" # CHANGEME
-categories = ["cryptography::cryptocurrencies"] # CHANGEME
-keywords = ["crypto", "bitcoin"] # CHANGEME
+authors = ["Alpen Labs <noreply@alpenlabs.io>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/alpenlabs/strata-common-services"
 
 [workspace.lints]
 rust.missing_debug_implementations = "warn"
@@ -29,3 +20,14 @@ clippy.absolute_paths = "warn"
 rustdoc.all = "warn"
 
 [workspace.dependencies]
+async-trait = "0.1.80"
+parking_lot = "0.12.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_bytes = "0.11.15"
+thiserror = "2.0.11"
+tokio = { version = "1.52", features = ["full"] }
+tracing = "0.1"
+zkaleido = { git = "https://github.com/alpenlabs/zkaleido", features = [
+  "arbitrary",
+  "ssz",
+], tag = "v0.4.0" }
