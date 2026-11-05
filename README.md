@@ -1,124 +1,35 @@
-# Alpen Labs Rust Workspace Template
+# Strata Common Services
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache-blue.svg)](https://opensource.org/licenses/apache-2-0)
-[![ci](https://github.com/alpenlabs/rust-template/actions/workflows/lint.yml/badge.svg?event=push)](https://github.com/alpenlabs/rust-template/actions)
-[![docs](https://img.shields.io/badge/docs-docs.rs-orange)](https://docs.rs/rust-template)
+[![lint](https://github.com/alpenlabs/strata-common-services/actions/workflows/lint.yml/badge.svg?event=push)](https://github.com/alpenlabs/strata-common-services/actions/workflows/lint.yml)
+[![unit](https://github.com/alpenlabs/strata-common-services/actions/workflows/unit.yml/badge.svg?event=push)](https://github.com/alpenlabs/strata-common-services/actions/workflows/unit.yml)
 
-This repo is a template for easy setup of a Rust workspace project within
-[`AlpenLabs` GitHub organization](https://github.com/alpenlabs).
-If you are looking for the single crate template, you can find it at
-[`alpenlabs/rust-template`](https://github.com/alpenlabs/rust-template).
+Services shared by [Alpen](https://github.com/alpenlabs/alpen) and Alpen EE.
+The crates here were moved out of the Alpen workspace so that both nodes can
+depend on one copy. This workspace does not depend on Alpen or Alpen EE.
 
-- It comes with a preconfigured `.justfile` for common tasks.
-- Licensing is taken care of, with dual MIT-Apache 2.0 licenses.
-- Continuous Integration is already set up with the common GitHub actions jobs
-hardened with [`zizmor`](https://docs.zizmor.sh).
-- Dependabot is enabled to automatically bump Rust and GitHub actions dependencies monthly.
-- There are 1 pull request template and 2 issues templates for bug reports and feature requests.
-- Proper lints for code maintainability are added to `Cargo.toml`.
-- If you need to publish crates to `crates.io`, you can use the `just publish` command,
-  and it will be automatically triggered by CI on every new tag release.
-  You just need to add a crates.io token to the `CARGO_REGISTRY_TOKEN` repository secret variable.
+## Crates
 
-This template has a lot of `CHANGEME` placeholders that you should replace with your own values, as well as URLs pointing to the `rust-template` project.
-Please do a repository-wide search and replace all occurrences of `CHANGEME` and `rust-template` with your own values.
+| Crate | Path | What it does |
+| --- | --- | --- |
+| `strata-prover-core` | [`crates/prover-core`](crates/prover-core/README.md) | Durable proof tasks: input assembly, native or remote proving, receipt storage, retries and crash recovery. |
+| `strata-paas` | [`crates/paas`](crates/paas/README.md) | Runs a `Prover` as a service-framework service with a command handle and periodic ticks. |
 
-## Settings and Branch Protection Rules
+## Development
 
-Note that settings and branch protection rules are not ported over to new repositories
-created using templates.
-Hence, you'll need to change settings and add branch protection rules manually.
-Here's a suggestion for branch protection rules for the default branch,
-i.e. `main`:
+The toolchain is pinned in `rust-toolchain.toml`. Run `just setup` once to
+enable the pre-commit hook, then:
 
-```json
-{
-  "id": 2405180,
-  "name": "Main Branch Protection",
-  "target": "branch",
-  "source_type": "Repository",
-  "source": "alpenlabs/NAME",
-  "enforcement": "active",
-  "conditions": {
-    "ref_name": {
-      "exclude": [],
-      "include": [
-        "~DEFAULT_BRANCH"
-      ]
-    }
-  },
-  "rules": [
-    {
-      "type": "deletion"
-    },
-    {
-      "type": "non_fast_forward"
-    },
-    {
-      "type": "pull_request",
-      "parameters": {
-        "required_approving_review_count": 1,
-        "dismiss_stale_reviews_on_push": true,
-        "require_code_owner_review": false,
-        "require_last_push_approval": false,
-        "required_review_thread_resolution": false,
-        "automatic_copilot_code_review_enabled": false,
-        "allowed_merge_methods": [
-          "merge",
-          "squash",
-          "rebase"
-        ]
-      }
-    },
-    {
-      "type": "required_status_checks",
-      "parameters": {
-        "strict_required_status_checks_policy": false,
-        "do_not_enforce_on_create": false,
-        "required_status_checks": [
-          {
-            "context": "Check that lints passed",
-            "integration_id": 15368
-          },
-          {
-            "context": "Check that unit tests pass",
-            "integration_id": 15368
-          }
-        ]
-      }
-    },
-    {
-      "type": "merge_queue",
-      "parameters": {
-        "merge_method": "SQUASH",
-        "max_entries_to_build": 5,
-        "min_entries_to_merge": 1,
-        "max_entries_to_merge": 5,
-        "min_entries_to_merge_wait_minutes": 5,
-        "grouping_strategy": "ALLGREEN",
-        "check_response_timeout_minutes": 60
-      }
-    }
-  ],
-  "bypass_actors": [
-    {
-      "actor_id": 5,
-      "actor_type": "RepositoryRole",
-      "bypass_mode": "pull_request"
-    }
-  ]
-}
+```sh
+just lints   # taplo, rustfmt and clippy
+just test    # nextest and doctests
 ```
-## Features
 
-- Feature 1
-- Feature 2
+Building the docs needs the same rustdoc flag as CI:
 
-## Usage
-
-```rust
-// How to use the library/binary.
+```sh
+RUSTDOCFLAGS="-Znext-solver=coherence -D warnings" cargo doc --workspace --all-features --no-deps
 ```
 
 ## Contributing
