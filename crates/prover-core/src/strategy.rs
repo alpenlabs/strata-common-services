@@ -42,10 +42,10 @@ where
 {
     fn prove(
         &self,
-        input: &<H::Program as ZkVmProgram>::Input,
+        input: <H::Program as ZkVmProgram>::Input,
         _ctx: ProveContext,
     ) -> ProverResult<ProofReceiptWithMetadata> {
-        H::Program::prove(input, self.host.as_ref()).map_err(ProverError::from_zkvm)
+        H::Program::prove(&input, self.host.as_ref()).map_err(ProverError::from_zkvm)
     }
 }
 
@@ -163,7 +163,7 @@ where
 {
     fn prove(
         &self,
-        input: &<H::Program as ZkVmProgram>::Input,
+        input: <H::Program as ZkVmProgram>::Input,
         mut ctx: ProveContext,
     ) -> ProverResult<ProofReceiptWithMetadata> {
         let host = self.host.clone();
@@ -183,6 +183,7 @@ where
                 match Host::ProofId::try_from(saved) {
                     Ok(id) => {
                         tracing::info!(%id, "resuming remote proof from saved metadata");
+                        drop(input);
                         ctx.release_submission_permit();
                         id
                     }
@@ -192,8 +193,10 @@ where
                     }
                 }
             } else {
-                // Fresh submission.
-                let id = self.submit_proof::<H>(input, &host).await?;
+                // Fresh submission. The input is not needed once the proof is
+                // submitted, so polling does not keep the witness in memory.
+                let id = self.submit_proof::<H>(&input, &host).await?;
+                drop(input);
                 ctx.persist(id.clone().into());
                 ctx.release_submission_permit();
                 id
@@ -252,11 +255,12 @@ where
 
     async fn start_fresh<H: ProofSpec>(
         &self,
-        input: &<H::Program as ZkVmProgram>::Input,
+        input: <H::Program as ZkVmProgram>::Input,
         host: &Host,
         ctx: &mut ProveContext,
     ) -> ProverResult<ProofReceiptWithMetadata> {
-        let proof_id = self.submit_proof::<H>(input, host).await?;
+        let proof_id = self.submit_proof::<H>(&input, host).await?;
+        drop(input);
         ctx.persist(proof_id.clone().into());
         ctx.release_submission_permit();
         self.poll_until_done::<H>(host, &proof_id, self.poll_interval)
