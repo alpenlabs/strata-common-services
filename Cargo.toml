@@ -34,3 +34,4 @@ zkaleido = { git = "https://github.com/alpenlabs/zkaleido", features = [
   "arbitrary",
   "ssz",
 ], tag = "v0.4.0" }
+zkaleido-native-adapter = { git = "https://github.com/alpenlabs/zkaleido", tag = "v0.4.0" }

@@ -20,7 +20,7 @@ mod traits;
 pub use config::{LocalRetryConfig, ProverConfig, RetryConfig};
 pub use error::{FailureAction, ProverError, ProverResult};
 pub use in_memory::{InMemoryReceiptStore, InMemoryTaskStore};
-pub use prover::{Prover, ProverBuilder};
+pub use prover::{ConcurrencyBudget, Prover, ProverBuilder};
 pub use task::{AttemptCounts, TaskRecord, TaskRecordData, TaskResult, TaskStatus};
 pub use traits::{InputResolution, ProofSpec, ReceiptHook, ReceiptStore, TaskKey, TaskStore};
 pub use zkaleido::{ProofReceiptWithMetadata, ZkVmHost, ZkVmProgram};

@@ -183,6 +183,7 @@ where
                 match Host::ProofId::try_from(saved) {
                     Ok(id) => {
                         tracing::info!(%id, "resuming remote proof from saved metadata");
+                        ctx.release_submission_permit();
                         id
                     }
                     Err(_) => {
@@ -194,6 +195,7 @@ where
                 // Fresh submission.
                 let id = self.submit_proof::<H>(input, &host).await?;
                 ctx.persist(id.clone().into());
+                ctx.release_submission_permit();
                 id
             };
 
@@ -234,6 +236,7 @@ where
     ) -> ProverResult<ProofReceiptWithMetadata> {
         let proof_id = self.submit_proof::<H>(input, host).await?;
         ctx.persist(proof_id.clone().into());
+        ctx.release_submission_permit();
         self.poll_until_done::<H>(host, &proof_id, self.poll_interval)
             .await
     }
