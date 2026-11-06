@@ -29,6 +29,8 @@ budget does not make overlapping task stores safe.
 Dispatch tries `Pending` rows before due retries, each in the task store's key
 order, and skips its scans while no capacity is free. A failed task-store write
 is logged and leaves the row `Proving`, so restart recovery retries the task.
+An attempt that panics is retried like one that died with the process, and fails
+only once its retry budget is spent.
 
 ## What problem does this solve?
 

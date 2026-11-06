@@ -348,17 +348,54 @@ impl<H: ProofSpec> Prover<H> {
         };
         // The status carries the attempt counters, so they survive a crash
         // that recovery later counts as a failed attempt.
-        self.task_store.update_status(
-            &key,
-            TaskStatus::Proving {
-                counts: status.counts(),
-            },
-        )?;
+        let counts = status.counts();
+        self.task_store
+            .update_status(&key, TaskStatus::Proving { counts })?;
+        let attempt = tokio::spawn({
+            let prover = Arc::clone(self);
+            let (task, key) = (task.clone(), key.clone());
+            async move { prover.run_task(task, key, record, permit).await }
+        });
+        // A panic in the attempt would otherwise leave the row `Proving`,
+        // which dispatch never restarts and whose waiters never hear an end.
         let prover = Arc::clone(self);
         tokio::spawn(async move {
-            prover.run_task(task, key, record, permit).await;
+            if let Err(e) = attempt.await {
+                if e.is_panic() {
+                    prover.settle_panicked_attempt(&task, &key, counts);
+                }
+            }
         });
         Ok(())
+    }
+
+    /// Treats a panicked attempt like a process that died mid-`Proving`.
+    ///
+    /// It applies the same bounded resume-class retry as startup recovery,
+    /// without waiting for a restart. A panic is a bug in this process, not
+    /// evidence that the task is invalid, so it fails the task only once the
+    /// retry budget is spent. A row that no longer holds this attempt's
+    /// `Proving` status was settled before the panic and is left alone.
+    fn settle_panicked_attempt(&self, task: &H::Task, key: &[u8], counts: AttemptCounts) {
+        let attempt_status = TaskStatus::Proving { counts };
+        match self.task_store.get(key) {
+            Ok(Some(record)) if record.status() == &attempt_status => {}
+            Ok(_) => return,
+            Err(e) => {
+                error!(
+                    %e,
+                    %task,
+                    "failed to read panicked proof attempt; restart recovery will retry the task"
+                );
+                return;
+            }
+        }
+        error!(%task, "proof attempt panicked; scheduling resume-class retry");
+        self.settle(
+            key,
+            task,
+            self.schedule_retry(key, "proof attempt panicked", counts, false),
+        );
     }
 
     /// Runs one attempt of a task that dispatch has marked `Proving`.
