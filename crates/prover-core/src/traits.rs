@@ -355,4 +355,19 @@ pub(crate) trait ProveStrategy<H: ProofSpec>: Send + Sync + 'static {
         input: &<H::Program as ZkVmProgram>::Input,
         ctx: ProveContext,
     ) -> ProverResult<ProofReceiptWithMetadata>;
+
+    /// Whether `saved` metadata identifies an already submitted proof that
+    /// [`Self::resume`] can finish without the task's input.
+    fn can_resume(&self, _saved: &[u8]) -> bool {
+        false
+    }
+
+    /// Finishes the already submitted proof that `ctx.saved` identifies.
+    ///
+    /// Called only after [`Self::can_resume`] accepted that metadata.
+    fn resume(&self, _ctx: ProveContext) -> ProverResult<ProofReceiptWithMetadata> {
+        Err(ProverError::permanent(
+            "strategy has no resumable proof state",
+        ))
+    }
 }
