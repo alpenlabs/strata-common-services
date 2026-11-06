@@ -3,7 +3,8 @@
 use std::{fmt, sync::Arc};
 
 use strata_prover_core::{
-    ProofReceiptWithMetadata, ProofSpec, Prover, ProverError, ProverResult, TaskResult, TaskStatus,
+    ProofReceiptWithMetadata, ProofSpec, Prover, ProverError, ProverResult, ResetOutcome,
+    TaskResult, TaskStatus,
 };
 use strata_service::{CommandHandle, ServiceMonitor};
 
@@ -45,6 +46,19 @@ impl<H: ProofSpec> ProverHandle<H> {
     pub async fn submit(&self, task: H::Task) -> ProverResult<()> {
         self.cmd
             .send_and_wait(|c| Cmd::Submit {
+                task: task.clone(),
+                completion: c,
+            })
+            .await
+            .map_err(|e| ProverError::Command(e.to_string()))?
+    }
+
+    /// Return a `PermanentFailure` task to `Pending` and restart it.
+    ///
+    /// See [`Prover::reset_permanent_failure`] for what each [`ResetOutcome`] means.
+    pub async fn reset_permanent_failure(&self, task: H::Task) -> ProverResult<ResetOutcome> {
+        self.cmd
+            .send_and_wait(|c| Cmd::ResetPermanentFailure {
                 task: task.clone(),
                 completion: c,
             })

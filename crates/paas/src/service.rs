@@ -6,7 +6,7 @@
 
 use std::{fmt, marker::PhantomData, sync::Arc, time::Duration};
 
-use strata_prover_core::{ProofSpec, Prover, ProverResult, TaskResult};
+use strata_prover_core::{ProofSpec, Prover, ProverResult, ResetOutcome, TaskResult};
 
 /// Bounds a task payload must satisfy to travel over the paas command
 /// channel. Blanket-impl'd for every type that meets them, so
@@ -35,6 +35,10 @@ pub(crate) enum Cmd<T: CmdTask> {
     Execute {
         task: T,
         completion: CommandCompletionSender<ProverResult<TaskResult<T>>>,
+    },
+    ResetPermanentFailure {
+        task: T,
+        completion: CommandCompletionSender<ProverResult<ResetOutcome>>,
     },
 }
 
@@ -104,6 +108,11 @@ async fn handle_cmd<H: ProofSpec>(prover: &Arc<Prover<H>>, cmd: Cmd<H::Task>) {
                     .map(|mut results| results.pop().expect("one result for one task"));
                 completion.send(result).await;
             });
+        }
+        Cmd::ResetPermanentFailure { task, completion } => {
+            trace!(?task, "handling reset command");
+            let result = prover.reset_permanent_failure(task).await;
+            completion.send(result).await;
         }
     }
 }
